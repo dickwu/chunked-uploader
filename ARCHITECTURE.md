@@ -6,63 +6,63 @@ The Chunked Upload Server is designed to handle large file uploads (10GB+) throu
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                                  CLIENT                                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
-│  │  Chunk 0    │  │  Chunk 1    │  │  Chunk 2    │  │  Chunk N    │        │
-│  │  (50MB)     │  │  (50MB)     │  │  (50MB)     │  │  (≤50MB)    │        │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘        │
+│                                  CLIENT                                     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
+│  │  Chunk 0    │  │  Chunk 1    │  │  Chunk 2    │  │  Chunk N    │         │
+│  │  (50MB)     │  │  (50MB)     │  │  (50MB)     │  │  (≤50MB)    │         │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
 │         │                │                │                │                │
-│         │ JWT Token 0    │ JWT Token 1    │ JWT Token 2    │ JWT Token N   │
-└─────────┼────────────────┼────────────────┼────────────────┼───────────────┘
+│         │ JWT Token 0    │ JWT Token 1    │ JWT Token 2    │ JWT Token N    │
+└─────────┼────────────────┼────────────────┼────────────────┼────────────────┘
           │                │                │                │
           ▼                ▼                ▼                ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              CLOUDFLARE CDN                                  │
-│                         (50MB request limit per chunk)                       │
+│                              CLOUDFLARE CDN                                 │
+│                         (50MB request limit per chunk)                      │
 └─────────────────────────────────────────────────────────────────────────────┘
           │                │                │                │
           ▼                ▼                ▼                ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          CHUNKED UPLOAD SERVER                               │
+│                          CHUNKED UPLOAD SERVER                              │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │                         Axum HTTP Router                               │  │
+│  │                         Axum HTTP Router                              │  │
 │  │  POST /upload/init     │  PUT /upload/{id}/part/{n}  │  GET /status   │  │
 │  │  POST /upload/complete │  DELETE /upload/{id}        │  GET /health   │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
-│                                    │                                         │
+│                                    │                                        │
 │  ┌─────────────────────────────────┼─────────────────────────────────────┐  │
-│  │                                 ▼                                      │  │
-│  │  ┌─────────────┐  ┌─────────────────────┐  ┌─────────────────────┐   │  │
-│  │  │ API Key     │  │   JWT Validator     │  │  Request Handler    │   │  │
-│  │  │ Middleware  │──▶  (per-part tokens)  │──▶  (business logic)   │   │  │
-│  │  └─────────────┘  └─────────────────────┘  └──────────┬──────────┘   │  │
+│  │                                 ▼                                     │  │
+│  │  ┌─────────────┐  ┌─────────────────────┐  ┌─────────────────────┐    │  │
+│  │  │ API Key     │  │   JWT Validator     │  │  Request Handler    │    │  │
+│  │  │ Middleware  │──▶  (per-part tokens)  │──▶  (business logic)   │    │  │
+│  │  └─────────────┘  └─────────────────────┘  └──────────┬──────────┘    │  │
 │  │                           AUTH LAYER                   │              │  │
-│  └───────────────────────────────────────────────────────┼──────────────┘  │
+│  └───────────────────────────────────────────────────────┼───────────────┘  │
 │                                                          │                  │
-│  ┌───────────────────────────────────────────────────────┼──────────────┐  │
+│  ┌───────────────────────────────────────────────────────┼───────────────┐  │
 │  │                                                       ▼               │  │
-│  │  ┌─────────────────────────────────────────────────────────────────┐ │  │
-│  │  │                      SQLite Database                             │ │  │
-│  │  │  ┌─────────────┐              ┌──────────────────┐              │ │  │
-│  │  │  │   uploads   │──────────────│   upload_parts   │              │ │  │
-│  │  │  │  - id       │   1:N        │  - upload_id     │              │ │  │
-│  │  │  │  - filename │              │  - part_number   │              │ │  │
-│  │  │  │  - status   │              │  - status        │              │ │  │
-│  │  │  │  - webhook  │              │  - token_hash    │              │ │  │
-│  │  │  └─────────────┘              └──────────────────┘              │ │  │
-│  │  └─────────────────────────────────────────────────────────────────┘ │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
+│  │  │                      SQLite Database                            │  │  │
+│  │  │  ┌─────────────┐              ┌──────────────────┐              │  │  │
+│  │  │  │   uploads   │──────────────│   upload_parts   │              │  │  │
+│  │  │  │  - id       │   1:N        │  - upload_id     │              │  │  │
+│  │  │  │  - filename │              │  - part_number   │              │  │  │
+│  │  │  │  - status   │              │  - status        │              │  │  │
+│  │  │  │  - webhook  │              │  - token_hash    │              │  │  │
+│  │  │  └─────────────┘              └──────────────────┘              │  │  │
+│  │  └─────────────────────────────────────────────────────────────────┘  │  │
 │  │                         PERSISTENCE LAYER                             │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
-│                                    │                                         │
+│                                    │                                        │
 │  ┌─────────────────────────────────┼─────────────────────────────────────┐  │
-│  │                                 ▼                                      │  │
-│  │  ┌─────────────────────┐  ┌─────────────────────┐                    │  │
-│  │  │   Local Storage     │  │    S3 Storage       │                    │  │
-│  │  │   ./uploads/        │  │    s3://bucket/     │                    │  │
-│  │  │   ├── parts/        │  │    ├── parts/       │                    │  │
-│  │  │   │   └── {id}/     │  │    │   └── {id}/    │                    │  │
-│  │  │   └── files/        │  │    └── files/       │                    │  │
-│  │  └─────────────────────┘  └─────────────────────┘                    │  │
+│  │                                 ▼                                     │  │
+│  │  ┌─────────────────────┐  ┌─────────────────────┐                     │  │
+│  │  │   Local Storage     │  │    S3 Storage       │                     │  │
+│  │  │   ./uploads/        │  │    s3://bucket/     │                     │  │
+│  │  │   ├── parts/        │  │    ├── parts/       │                     │  │
+│  │  │   │   └── {id}/     │  │    │   └── {id}/    │                     │  │
+│  │  │   └── files/        │  │    └── files/       │                     │  │
+│  │  └─────────────────────┘  └─────────────────────┘                     │  │
 │  │                         STORAGE LAYER                                 │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -96,11 +96,11 @@ The Chunked Upload Server is designed to handle large file uploads (10GB+) throu
     │                               │  INSERT upload_parts          │
     │                               │──────────────────────────────▶│
     │                               │                               │
-    │  {file_id, parts: [          │                               │
-    │    {part: 0, token: "..."},  │                               │
-    │    {part: 1, token: "..."},  │                               │
-    │    ...                       │                               │
-    │  ]}                          │                               │
+    │  {file_id, parts: [           │                               │
+    │    {part: 0, token: "..."},   │                               │
+    │    {part: 1, token: "..."},   │                               │
+    │    ...                        │                               │
+    │  ]}                           │                               │
     │◀──────────────────────────────│                               │
     │                               │                               │
 ```
@@ -152,21 +152,21 @@ The Chunked Upload Server is designed to handle large file uploads (10GB+) throu
     │  X-API-Key: {key}             │                  │                  │
     │──────────────────────────────▶│                  │                  │
     │                               │                  │                  │
-    │                               │  Verify all parts uploaded         │
+    │                               │  Verify all parts uploaded          │
     │                               │                  │                  │
     │                               │  Assemble parts  │                  │
     │                               │─────────────────▶│                  │
     │                               │                  │                  │
     │                               │  For i in 0..N:  │                  │
     │                               │    Read part_i   │                  │
-    │                               │    Append to final                 │
+    │                               │    Append to final                  │
     │                               │    Delete part_i │                  │
     │                               │                  │                  │
     │                               │  Update status   │                  │
-    │                               │  (pending → complete)              │
+    │                               │  (pending → complete)               │
     │                               │                  │                  │
-    │                               │  POST webhook (async)              │
-    │                               │─────────────────────────────────────▶
+    │                               │  POST webhook (async)               │
+    │                               │──────────────────────────────────────▶
     │                               │                  │                  │
     │  {status: complete,           │                  │                  │
     │   final_path: "..."}          │                  │                  │
@@ -218,21 +218,21 @@ The Chunked Upload Server is designed to handle large file uploads (10GB+) throu
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  Management Endpoints (init, status, complete, cancel)          │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  X-API-Key Header                                        │   │
-│  │  - Static key from environment                           │   │
-│  │  - Full access to upload management                      │   │
-│  └─────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  X-API-Key Header                                       │    │
+│  │  - Static key from environment                          │    │
+│  │  - Full access to upload management                     │    │
+│  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
 │  Part Upload Endpoint (PUT /upload/{id}/part/{n})               │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Authorization: Bearer {JWT}                             │   │
-│  │  - Token generated at init time                          │   │
-│  │  - Bound to specific upload_id + part_number             │   │
-│  │  - Contains expected size for validation                 │   │
-│  │  - Has expiration time                                   │   │
-│  │  - Hash stored in DB for verification                    │   │
-│  └─────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Authorization: Bearer {JWT}                            │    │
+│  │  - Token generated at init time                         │    │
+│  │  - Bound to specific upload_id + part_number            │    │
+│  │  - Contains expected size for validation                │    │
+│  │  - Has expiration time                                  │    │
+│  │  - Hash stored in DB for verification                   │    │
+│  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -295,7 +295,7 @@ Assembly uses S3 multipart upload with `UploadPartCopy` for efficient server-sid
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     CLEANUP SERVICE                              │
+│                     CLEANUP SERVICE                             │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  Runs every: 1 hour                                             │
