@@ -16,26 +16,26 @@ A production-ready Rust HTTP server supporting **resumable chunked uploads** for
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Client                                   │
+│                         Client                                  │
 └─────────────────────────────────────────────────────────────────┘
                               │
               1. POST /upload/init (API Key)
               │ Returns: file_id + JWT tokens for each part
               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Upload Server (Rust/Axum)                     │
+│                    Upload Server (Rust/Axum)                    │
 ├─────────────────────────────────────────────────────────────────┤
 │  2. PUT /upload/{id}/part/{n} (JWT Token per part)              │
-│     - Validates token                                            │
-│     - Stores chunk                                               │
-│     - Updates SQLite                                             │
-│                                                                  │
+│     - Validates token                                           │
+│     - Stores chunk                                              │
+│     - Updates SQLite                                            │
+│                                                                 │
 │  3. GET /upload/{id}/status (API Key)                           │
 │     - Returns progress: [{part: 0, status: "uploaded"}, ...]    │
-│                                                                  │
+│                                                                 │
 │  4. POST /upload/{id}/complete (API Key)                        │
-│     - Assembles all parts                                        │
-│     - Returns final file path                                    │
+│     - Assembles all parts                                       │
+│     - Returns final file path                                   │
 └─────────────────────────────────────────────────────────────────┘
                               │
               ┌───────────────┴───────────────┐
