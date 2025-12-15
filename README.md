@@ -51,17 +51,58 @@ A production-ready Rust HTTP server supporting **resumable chunked uploads** for
 ### 1. Setup
 
 ```bash
-# Clone and build
-cd server
-cp .env.example .env
-# Edit .env with your API_KEY and JWT_SECRET
+# Initialize environment (generates .env with secure random keys)
+./init.sh
 
-# Build and run
+# Edit .env if needed (e.g., change storage path, port)
+nano .env
+
+# Build
 cargo build --release
+```
+
+### 2. Deploy as Service
+
+#### macOS (launchd)
+
+```bash
+# Deploy and start service (creates LaunchAgent and loads it)
+./deploy-mac.sh
+
+# Service management
+launchctl list | grep chunked-uploader    # Check status
+launchctl unload ~/Library/LaunchAgents/com.grace.chunked-uploader.plist  # Stop
+launchctl load ~/Library/LaunchAgents/com.grace.chunked-uploader.plist    # Start
+
+# View logs
+tail -f chunked-uploader.stdout.log
+```
+
+#### Linux (systemd)
+
+```bash
+# Deploy and start service (requires sudo)
+sudo ./deploy-linux.sh
+
+# Service management
+sudo systemctl status chunked-uploader    # Check status
+sudo systemctl restart chunked-uploader   # Restart
+sudo systemctl stop chunked-uploader      # Stop
+sudo systemctl enable chunked-uploader    # Enable on boot
+
+# View logs
+sudo journalctl -u chunked-uploader -f
+# or
+tail -f chunked-uploader.stdout.log
+```
+
+#### Manual Run (Development)
+
+```bash
 ./target/release/chunked-uploader
 ```
 
-### 2. Initialize Upload
+### 3. Initialize Upload
 
 ```bash
 curl -X POST http://localhost:3000/upload/init \
@@ -89,7 +130,7 @@ Response:
 }
 ```
 
-### 3. Upload Parts
+### 4. Upload Parts
 
 Upload each 50MB chunk with its corresponding JWT token:
 
@@ -113,7 +154,7 @@ Response:
 }
 ```
 
-### 4. Check Progress (for resume)
+### 5. Check Progress (for resume)
 
 ```bash
 curl -X GET "http://localhost:3000/upload/${FILE_ID}/status" \
@@ -137,7 +178,7 @@ Response:
 }
 ```
 
-### 5. Complete Upload
+### 6. Complete Upload
 
 After all parts are uploaded:
 
@@ -158,7 +199,7 @@ Response:
 }
 ```
 
-### 6. Cancel Upload (optional)
+### 7. Cancel Upload (optional)
 
 ```bash
 curl -X DELETE "http://localhost:3000/upload/${FILE_ID}" \
@@ -259,6 +300,51 @@ def upload_file(file_path):
 
 if __name__ == "__main__":
     upload_file(FILE_PATH)
+```
+
+## Scripts Reference
+
+| Script | Description |
+|--------|-------------|
+| `init.sh` | Generates `.env` file with secure random API_KEY and JWT_SECRET |
+| `deploy-mac.sh` | Creates macOS LaunchAgent and starts service (auto-restarts on reboot) |
+| `deploy-linux.sh` | Creates systemd service and starts it (requires sudo, auto-restarts on reboot) |
+
+### init.sh
+
+Initializes the environment configuration:
+- Generates cryptographically secure `API_KEY` and `JWT_SECRET`
+- Creates `.env` file with default settings
+- Creates `uploads` directory
+
+```bash
+./init.sh
+```
+
+### deploy-mac.sh
+
+Deploys on macOS using launchd:
+- Creates `~/Library/LaunchAgents/com.grace.chunked-uploader.plist`
+- Waits for external volumes (e.g., `/Volumes/...`) to mount before starting
+- Auto-restarts if the process crashes
+- Starts automatically on login
+
+```bash
+./deploy-mac.sh           # Deploy and start
+./deploy-mac.sh --run     # Run mode (used by launchd internally)
+```
+
+### deploy-linux.sh
+
+Deploys on Linux using systemd:
+- Creates `/etc/systemd/system/chunked-uploader.service`
+- Waits for mount points (e.g., `/mnt/...`, `/media/...`) before starting
+- Auto-restarts if the process crashes
+- Starts automatically on boot
+
+```bash
+sudo ./deploy-linux.sh           # Deploy and start
+./deploy-linux.sh --run          # Run mode (used by systemd internally)
 ```
 
 ## Building
