@@ -16,7 +16,7 @@ pub struct LocalStorage {
 impl LocalStorage {
     pub fn new(base_path: &str) -> Result<Self> {
         let base_path = PathBuf::from(base_path);
-        let parts_path = base_path.join("parts");
+        let parts_path = base_path.join(".parts");
         let final_path = base_path.join("files");
 
         // Create directories synchronously during initialization

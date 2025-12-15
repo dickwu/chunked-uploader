@@ -37,7 +37,7 @@ impl S3Storage {
     }
 
     fn get_part_key(&self, upload_id: &str, part_number: i32) -> String {
-        format!("parts/{}/part_{:06}", upload_id, part_number)
+        format!(".parts/{}/part_{:06}", upload_id, part_number)
     }
 
     fn get_final_key(&self, upload_id: &str, filename: &str) -> String {
@@ -185,7 +185,7 @@ impl StorageBackend for S3Storage {
 
     async fn delete_parts(&self, upload_id: &str) -> Result<()> {
         // List all parts for this upload
-        let prefix = format!("parts/{}/", upload_id);
+        let prefix = format!(".parts/{}/", upload_id);
 
         let list_response = self
             .client
