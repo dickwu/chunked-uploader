@@ -8,6 +8,7 @@ use super::StorageBackend;
 use crate::error::{AppError, Result};
 
 pub struct LocalStorage {
+    #[allow(dead_code)]
     base_path: PathBuf,
     parts_path: PathBuf,
     final_path: PathBuf,

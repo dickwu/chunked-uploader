@@ -29,6 +29,18 @@ fi
 
 # --- Deploy mode (default: create plist and load service) ---
 
+# Build the project
+echo "Updating dependencies..."
+cargo update
+
+echo "Building release binary..."
+cargo build --release
+if [ $? -ne 0 ]; then
+    echo "Build failed!"
+    exit 1
+fi
+echo "Build successful"
+
 # Create LaunchAgents directory if it doesn't exist
 mkdir -p "$HOME_DIR/Library/LaunchAgents"
 

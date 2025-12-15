@@ -30,6 +30,7 @@ impl ApiKeyAuth {
 }
 
 /// Middleware for API key validation (optional, can be used as layer)
+#[allow(dead_code)]
 pub async fn api_key_middleware(
     request: Request,
     next: Next,

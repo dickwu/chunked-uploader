@@ -29,6 +29,18 @@ fi
 
 # --- Deploy mode (default: create systemd service and enable) ---
 
+# Build the project (before requiring root)
+echo "Updating dependencies..."
+cargo update
+
+echo "Building release binary..."
+cargo build --release
+if [ $? -ne 0 ]; then
+    echo "Build failed!"
+    exit 1
+fi
+echo "Build successful"
+
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
     echo "Deploy mode requires root privileges. Please run with sudo."

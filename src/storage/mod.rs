@@ -5,12 +5,8 @@ pub mod s3;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::pin::Pin;
-use futures::Stream;
 
 use crate::error::Result;
-
-pub type ByteStream = Pin<Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>>;
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
