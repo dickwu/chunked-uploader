@@ -44,8 +44,10 @@ echo "Build successful"
 # Create LaunchAgents directory if it doesn't exist
 mkdir -p "$HOME_DIR/Library/LaunchAgents"
 
-# Unload existing service if running
+# Stop existing service if running
 launchctl unload "$PLIST_PATH" 2>/dev/null
+pkill -f "chunked-uploader" 2>/dev/null
+sleep 1
 
 # Create the launchd plist file
 cat > "$PLIST_PATH" << EOF
@@ -91,6 +93,14 @@ echo "Service loaded: $PLIST_NAME"
 sleep 2
 if launchctl list | grep -q "$PLIST_NAME"; then
     echo "Service is running"
+    # Health check
+    source "$SCRIPT_DIR/.env"
+    PORT="${SERVER_PORT:-5001}"
+    if curl -s "http://127.0.0.1:$PORT/health" | grep -q "OK"; then
+        echo "Health check passed: http://127.0.0.1:$PORT"
+    else
+        echo "Warning: Health check failed"
+    fi
 else
     echo "Warning: Service may not have started correctly"
 fi

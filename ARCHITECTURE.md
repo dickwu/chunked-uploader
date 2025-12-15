@@ -36,7 +36,7 @@ The Chunked Upload Server is designed to handle large file uploads (10GB+) throu
 │  │  │ API Key     │  │   JWT Validator     │  │  Request Handler    │    │  │
 │  │  │ Middleware  │──▶  (per-part tokens)  │──▶  (business logic)   │    │  │
 │  │  └─────────────┘  └─────────────────────┘  └──────────┬──────────┘    │  │
-│  │                           AUTH LAYER                   │              │  │
+│  │                           AUTH LAYER                  │               │  │
 │  └───────────────────────────────────────────────────────┼───────────────┘  │
 │                                                          │                  │
 │  ┌───────────────────────────────────────────────────────┼───────────────┐  │
