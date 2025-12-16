@@ -8,7 +8,7 @@ A production-ready Rust HTTP server supporting **resumable chunked uploads** for
 - **Resumable Uploads**: Continue interrupted uploads from where they left off
 - **Cloudflare Compatible**: 50MB default chunk size fits within Cloudflare's request limits
 - **JWT-based Part Authentication**: Each chunk has its own secure token
-- **Multiple Storage Backends**: Local filesystem or S3-compatible storage
+- **Multiple Storage Backends**: Local filesystem, SMB/NAS, or S3-compatible storage
 - **Auto Cleanup**: Expired incomplete uploads are automatically cleaned up
 - **Progress Tracking**: Real-time upload progress via SQLite persistence
 
@@ -38,12 +38,12 @@ A production-ready Rust HTTP server supporting **resumable chunked uploads** for
 │     - Returns final file path                                   │
 └─────────────────────────────────────────────────────────────────┘
                               │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-┌─────────────────────────┐     ┌─────────────────────────┐
-│    Local Storage        │     │    S3 Storage           │
-│    ./uploads/           │     │    s3://bucket/         │
-└─────────────────────────┘     └─────────────────────────┘
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+┌─────────────────────┐ ┌─────────────────┐ ┌─────────────────────┐
+│   Local Storage     │ │   SMB/NAS       │ │    S3 Storage       │
+│   ./uploads/        │ │   \\server\share│ │    s3://bucket/     │
+└─────────────────────┘ └─────────────────┘ └─────────────────────┘
 ```
 
 ## Quick Start
@@ -223,8 +223,15 @@ curl -X DELETE "http://localhost:3000/upload/${FILE_ID}" \
 |----------|---------|-------------|
 | `API_KEY` | *required* | API key for authentication |
 | `JWT_SECRET` | *required* | Secret for JWT token signing |
-| `STORAGE_BACKEND` | `local` | `local` or `s3` |
+| `STORAGE_BACKEND` | `local` | `local`, `smb`, or `s3` |
 | `LOCAL_STORAGE_PATH` | `./uploads` | Path for local storage |
+| `TEMP_STORAGE_PATH` | system temp | Local path for temporary chunk storage (fast SSD recommended) |
+| `SMB_HOST` | `localhost` | SMB server hostname or IP |
+| `SMB_PORT` | `445` | SMB server port |
+| `SMB_USER` | | SMB username |
+| `SMB_PASS` | | SMB password |
+| `SMB_SHARE` | `share` | SMB share name |
+| `SMB_PATH` | | Subdirectory within the share (optional) |
 | `S3_ENDPOINT` | AWS default | S3 endpoint URL |
 | `S3_BUCKET` | `uploads` | S3 bucket name |
 | `S3_REGION` | `us-east-1` | S3 region |
@@ -353,8 +360,14 @@ sudo ./deploy-linux.sh           # Deploy and start
 # Default build (local storage only)
 cargo build --release
 
+# With SMB/NAS support (pure Rust, no external dependencies)
+cargo build --release --features smb
+
 # With S3 support (requires native crypto libs)
 cargo build --release --features s3
+
+# With both SMB and S3 support
+cargo build --release --features "smb s3"
 
 # The binary will be at:
 ./target/release/chunked-uploader
@@ -400,6 +413,78 @@ S3_REGION=us-east-1
 AWS_ACCESS_KEY_ID=your-access-key
 AWS_SECRET_ACCESS_KEY=your-secret-key
 ```
+
+## SMB/NAS Storage Setup
+
+For SMB/CIFS network storage (NAS devices, Windows shares, Samba):
+
+```bash
+# .env
+STORAGE_BACKEND=smb
+SMB_HOST=192.168.1.100        # NAS IP or hostname
+SMB_PORT=445                   # Default SMB port
+SMB_USER=admin                 # SMB username
+SMB_PASS=your-password         # SMB password
+SMB_SHARE=uploads              # Share name on the server
+SMB_PATH=videos                # Optional: subdirectory within share
+
+# Optional: Fast local storage for temporary chunks (recommended)
+TEMP_STORAGE_PATH=/tmp/chunked-uploads
+```
+
+### SMB Storage Architecture
+
+The SMB backend uses a hybrid approach for optimal performance:
+
+1. **Chunks are stored locally** on fast storage (SSD) during upload
+2. **Final assembled file is transferred to SMB** after all chunks complete
+3. **Automatic cleanup** of local temporary files
+
+This design ensures:
+- Fast chunk uploads (no network latency per chunk)
+- Reliable large file transfers to NAS
+- Works with any SMB 3.0+ compatible server (Synology, QNAP, TrueNAS, Windows, Samba)
+
+### Building with SMB Support
+
+```bash
+# Build with SMB feature (pure Rust, no external dependencies)
+cargo build --release --features smb
+```
+
+### macOS Local Network Permission
+
+On macOS Sequoia (15.x) and later, apps need permission to access local network resources. When deploying with `deploy-mac.sh`, the service may need Local Network permission:
+
+1. Run the binary once manually to trigger the permission prompt:
+   ```bash
+   source .env && ./target/release/chunked-uploader
+   ```
+2. If prompted, allow "Local Network" access in System Settings > Privacy & Security > Local Network
+3. Then deploy normally with `./deploy-mac.sh`
+
+### Troubleshooting SMB Connection
+
+If SMB connection fails:
+
+```bash
+# Test network connectivity
+ping 192.168.1.100
+
+# Test SMB port
+nc -zv 192.168.1.100 445
+
+# Test SMB connection (on macOS/Linux)
+smbclient //192.168.1.100/share -U username
+
+# Check server logs
+tail -f chunked-uploader.stderr.log
+```
+
+Common issues:
+- **"No route to host"**: Network/firewall issue or macOS Local Network permission needed
+- **"Access denied"**: Check username/password
+- **"Share not found"**: Verify share name exists on server
 
 ## License
 

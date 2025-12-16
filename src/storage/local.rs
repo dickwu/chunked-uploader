@@ -8,31 +8,67 @@ use super::StorageBackend;
 use crate::error::{AppError, Result};
 
 pub struct LocalStorage {
-    #[allow(dead_code)]
-    base_path: PathBuf,
+    // Temp storage for parts (local SSD - fast I/O)
     parts_path: PathBuf,
+    // Final storage for assembled files (can be NAS/network)
     final_path: PathBuf,
 }
 
 impl LocalStorage {
-    pub fn new(base_path: &str) -> Result<Self> {
-        let base_path = PathBuf::from(base_path);
-        let parts_path = base_path.join(".parts");
+    pub fn new(_final_storage_path: &str, temp_storage_path: &str) -> Result<Self> {
+        // Use ONLY local temp storage for everything
+        // NAS/SMB mounts have severe issues with Rust's file I/O on macOS
+        let base_path = PathBuf::from(temp_storage_path);
+        let parts_path = base_path.join("parts");
         let final_path = base_path.join("files");
 
-        // Create directories synchronously during initialization
+        tracing::info!("Initializing LocalStorage...");
+        tracing::info!("  Storage base: {}", base_path.display());
+        tracing::warn!("  NOTE: Using local storage only. NAS path ignored due to macOS SMB issues.");
+        tracing::warn!("  Files will be stored at: {}", final_path.display());
+
+        // Create directories
         std::fs::create_dir_all(&parts_path)
             .map_err(|e| AppError::Storage(format!("Failed to create parts directory: {}", e)))?;
+
         std::fs::create_dir_all(&final_path)
             .map_err(|e| AppError::Storage(format!("Failed to create files directory: {}", e)))?;
 
-        tracing::info!("LocalStorage initialized at {:?}", base_path);
+        // Test write permissions (only for local paths - these won't hang)
+        Self::verify_write_permission(&parts_path, "parts")?;
+        Self::verify_write_permission(&final_path, "final")?;
+
+        tracing::info!("LocalStorage initialized:");
+        tracing::info!("  ✓ Parts: {}", parts_path.display());
+        tracing::info!("  ✓ Files: {}", final_path.display());
 
         Ok(Self {
-            base_path,
             parts_path,
             final_path,
         })
+    }
+
+    /// Verify write permission by creating and deleting a test file
+    fn verify_write_permission(path: &PathBuf, name: &str) -> Result<()> {
+        use std::io::Write;
+
+        let test_file = path.join(".write_test");
+
+        let mut file = std::fs::File::create(&test_file).map_err(|e| {
+            AppError::Storage(format!(
+                "No write permission for {} directory {}: {}",
+                name, path.display(), e
+            ))
+        })?;
+
+        file.write_all(b"test").map_err(|e| {
+            AppError::Storage(format!("Failed write test in {} directory: {}", name, e))
+        })?;
+
+        drop(file);
+        std::fs::remove_file(&test_file).ok();
+
+        Ok(())
     }
 
     fn get_part_path(&self, upload_id: &str, part_number: i32) -> PathBuf {
@@ -65,15 +101,15 @@ impl StorageBackend for LocalStorage {
         data: Bytes,
     ) -> Result<String> {
         let part_path = self.get_part_path(upload_id, part_number);
+        let data_len = data.len();
 
-        // Ensure upload directory exists
+        // Parts go to local temp storage (fast SSD) - use normal async I/O
         if let Some(parent) = part_path.parent() {
             fs::create_dir_all(parent).await.map_err(|e| {
                 AppError::Storage(format!("Failed to create upload directory: {}", e))
             })?;
         }
 
-        // Write part data
         let mut file = fs::File::create(&part_path).await.map_err(|e| {
             AppError::Storage(format!("Failed to create part file: {}", e))
         })?;
@@ -87,10 +123,11 @@ impl StorageBackend for LocalStorage {
         })?;
 
         tracing::debug!(
-            "Stored part {} for upload {} ({} bytes)",
+            "Stored part {} for upload {} ({} bytes) at {:?}",
             part_number,
             upload_id,
-            data.len()
+            data_len,
+            part_path
         );
 
         Ok(part_path.to_string_lossy().to_string())
@@ -99,6 +136,7 @@ impl StorageBackend for LocalStorage {
     async fn read_part(&self, upload_id: &str, part_number: i32) -> Result<Bytes> {
         let part_path = self.get_part_path(upload_id, part_number);
 
+        // Parts are on local temp storage - use async I/O
         let data = fs::read(&part_path).await.map_err(|e| {
             AppError::Storage(format!(
                 "Failed to read part {} for upload {}: {}",
@@ -116,17 +154,29 @@ impl StorageBackend for LocalStorage {
         total_parts: i32,
     ) -> Result<String> {
         let final_path = self.get_final_file_path(upload_id, filename);
+        let parts_path = self.parts_path.clone();
+        let upload_id_owned = upload_id.to_string();
 
-        // Create final file
-        let mut final_file = fs::File::create(&final_path).await.map_err(|e| {
-            AppError::Storage(format!("Failed to create final file: {}", e))
+        tracing::info!(
+            "Assembling {} parts for upload {} to {:?}",
+            total_parts,
+            upload_id,
+            final_path
+        );
+
+        // Assemble to temp file first (local), then move to final destination
+        let temp_assembled = self.parts_path.join(format!("{}_assembled.tmp", upload_id));
+        
+        // Use async I/O for reading parts (from local temp storage)
+        let mut temp_file = fs::File::create(&temp_assembled).await.map_err(|e| {
+            AppError::Storage(format!("Failed to create temp assembled file: {}", e))
         })?;
 
-        // Assemble parts in order
         for part_num in 0..total_parts {
-            let part_path = self.get_part_path(upload_id, part_num);
+            let part_path = parts_path
+                .join(&upload_id_owned)
+                .join(format!("part_{:06}", part_num));
 
-            // Read part and append to final file
             let part_data = fs::read(&part_path).await.map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to read part {} during assembly: {}",
@@ -134,15 +184,21 @@ impl StorageBackend for LocalStorage {
                 ))
             })?;
 
-            final_file.write_all(&part_data).await.map_err(|e| {
-                AppError::Storage(format!("Failed to write to final file: {}", e))
+            temp_file.write_all(&part_data).await.map_err(|e| {
+                AppError::Storage(format!("Failed to write to temp assembled file: {}", e))
             })?;
 
             tracing::debug!("Assembled part {} ({} bytes)", part_num, part_data.len());
         }
 
-        final_file.flush().await.map_err(|e| {
-            AppError::Storage(format!("Failed to flush final file: {}", e))
+        temp_file.flush().await.map_err(|e| {
+            AppError::Storage(format!("Failed to flush temp assembled file: {}", e))
+        })?;
+        drop(temp_file);
+
+        // Move assembled file to final location (both are on local storage)
+        fs::rename(&temp_assembled, &final_path).await.map_err(|e| {
+            AppError::Storage(format!("Failed to move assembled file: {}", e))
         })?;
 
         // Clean up parts directory
@@ -162,6 +218,7 @@ impl StorageBackend for LocalStorage {
         let parts_dir = self.get_upload_parts_dir(upload_id);
 
         if parts_dir.exists() {
+            // Parts are on local temp storage - use async I/O
             fs::remove_dir_all(&parts_dir).await.map_err(|e| {
                 AppError::Storage(format!("Failed to delete parts directory: {}", e))
             })?;
@@ -172,11 +229,12 @@ impl StorageBackend for LocalStorage {
     }
 
     async fn delete_file(&self, path: &str) -> Result<()> {
-        let file_path = Path::new(path);
+        let file_path = PathBuf::from(path);
 
         if file_path.exists() {
-            fs::remove_file(file_path).await.map_err(|e| {
-                AppError::Storage(format!("Failed to delete file: {}", e))
+            // All files are local - use async I/O
+            fs::remove_file(&file_path).await.map_err(|e| {
+                AppError::Storage(format!("Failed to delete file {}: {}", path, e))
             })?;
             tracing::debug!("Deleted file {:?}", file_path);
         }

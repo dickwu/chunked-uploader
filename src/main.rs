@@ -7,6 +7,7 @@ mod services;
 mod storage;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
     Router,
 };
@@ -55,7 +56,25 @@ async fn main() -> anyhow::Result<()> {
     // Initialize storage backend
     let storage: Arc<dyn StorageBackend> = match config.storage_backend {
         config::StorageBackendType::Local => {
-            Arc::new(storage::local::LocalStorage::new(&config.local_storage_path)?)
+            tracing::info!("Temp storage: {}", config.temp_storage_path);
+            tracing::info!("Final storage: {}", config.local_storage_path);
+            Arc::new(storage::local::LocalStorage::new(
+                &config.local_storage_path,
+                &config.temp_storage_path,
+            )?)
+        }
+        #[cfg(feature = "smb")]
+        config::StorageBackendType::Smb => {
+            tracing::info!("Temp storage: {}", config.temp_storage_path);
+            tracing::info!("SMB: smb://{}@{}:{}/{}", config.smb_user, config.smb_host, config.smb_port, config.smb_share);
+            Arc::new(storage::smb::SmbStorage::new(
+                &config,
+                &config.temp_storage_path,
+            ).await?)
+        }
+        #[cfg(not(feature = "smb"))]
+        config::StorageBackendType::Smb => {
+            anyhow::bail!("SMB storage backend requires the 'smb' feature. Rebuild with: cargo build --features smb")
         }
         #[cfg(feature = "s3")]
         config::StorageBackendType::S3 => {
@@ -81,6 +100,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Build router
+    // Set body limit to chunk_size + 1MB buffer (default chunk is 50MB)
+    let body_limit = (config.chunk_size_bytes + 1024 * 1024) as usize;
+    tracing::info!("Max body size: {} MB", body_limit / 1024 / 1024);
+
     let app = Router::new()
         .route("/upload/init", post(handlers::init::init_upload))
         .route(
@@ -93,7 +116,8 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::complete::complete_upload),
         )
         .route("/upload/{id}", delete(handlers::cancel::cancel_upload))
-        .route("/health", get(|| async { "OK" }))
+        .route("/health", get(handlers::health::health_check))
+        .layer(DefaultBodyLimit::max(body_limit))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

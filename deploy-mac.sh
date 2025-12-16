@@ -6,35 +6,15 @@ PLIST_PATH="$HOME_DIR/Library/LaunchAgents/$PLIST_NAME.plist"
 
 cd "$SCRIPT_DIR"
 
-# --- Run mode (called by launchd with --run flag) ---
-if [[ "$1" == "--run" ]]; then
-    # Source the .env file
-    set -a
-    source "$SCRIPT_DIR/.env"
-    set +a
-
-    # Wait for external volume if LOCAL_STORAGE_PATH points to /Volumes/
-    if [[ "$LOCAL_STORAGE_PATH" == /Volumes/* ]]; then
-        VOLUME_PATH=$(echo "$LOCAL_STORAGE_PATH" | cut -d'/' -f1-3)
-        echo "Waiting for volume: $VOLUME_PATH"
-        while [ ! -d "$VOLUME_PATH" ]; do
-            sleep 5
-        done
-        echo "Volume $VOLUME_PATH is mounted"
-    fi
-
-    # Run the binary
-    exec "$SCRIPT_DIR/target/release/chunked-uploader"
-fi
-
-# --- Deploy mode (default: create plist and load service) ---
+# --- Deploy mode ---
 
 # Build the project
 echo "Updating dependencies..."
 cargo update
 
 echo "Building release binary..."
-cargo build --release
+# Include SMB support (pure Rust, no C dependencies needed)
+cargo build --release --features smb
 if [ $? -ne 0 ]; then
     echo "Build failed!"
     exit 1
@@ -49,7 +29,45 @@ launchctl unload "$PLIST_PATH" 2>/dev/null
 pkill -f "chunked-uploader" 2>/dev/null
 sleep 1
 
-# Create the launchd plist file
+# Load .env file to get environment variables
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+# Build EnvironmentVariables dict from .env file
+ENV_DICT=""
+while IFS= read -r line || [ -n "$line" ]; do
+    # Skip comments and empty lines
+    line=$(echo "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^#.*$ ]] && continue
+    
+    # Split key and value
+    key=$(echo "$line" | cut -d'=' -f1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    value=$(echo "$line" | cut -d'=' -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    
+    # Skip if key is empty
+    [[ -z "$key" ]] && continue
+    
+    # Remove quotes from value if present
+    value=$(echo "$value" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    
+    # Escape special characters in value for XML
+    value=$(echo "$value" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+    
+    if [ -n "$ENV_DICT" ]; then
+        ENV_DICT="$ENV_DICT
+        <key>$key</key>
+        <string>$value</string>"
+    else
+        ENV_DICT="        <key>$key</key>
+        <string>$value</string>"
+    fi
+done < "$SCRIPT_DIR/.env"
+
+# Create the launchd plist file - run binary directly with environment variables
 cat > "$PLIST_PATH" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -60,9 +78,7 @@ cat > "$PLIST_PATH" << EOF
     
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>$SCRIPT_DIR/deploy-mac.sh</string>
-        <string>--run</string>
+        <string>$SCRIPT_DIR/target/release/chunked-uploader</string>
     </array>
     
     <key>WorkingDirectory</key>
@@ -74,11 +90,25 @@ cat > "$PLIST_PATH" << EOF
     <key>KeepAlive</key>
     <true/>
     
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    
     <key>StandardOutPath</key>
     <string>$SCRIPT_DIR/chunked-uploader.stdout.log</string>
     
     <key>StandardErrorPath</key>
     <string>$SCRIPT_DIR/chunked-uploader.stderr.log</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>$HOME_DIR</string>
+        <key>USER</key>
+        <string>$(id -un)</string>
+$ENV_DICT
+    </dict>
 </dict>
 </plist>
 EOF

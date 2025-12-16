@@ -56,13 +56,13 @@ The Chunked Upload Server is designed to handle large file uploads (10GB+) throu
 │                                    │                                        │
 │  ┌─────────────────────────────────┼─────────────────────────────────────┐  │
 │  │                                 ▼                                     │  │
-│  │  ┌─────────────────────┐  ┌─────────────────────┐                     │  │
-│  │  │   Local Storage     │  │    S3 Storage       │                     │  │
-│  │  │   ./uploads/        │  │    s3://bucket/     │                     │  │
-│  │  │   ├── parts/        │  │    ├── parts/       │                     │  │
-│  │  │   │   └── {id}/     │  │    │   └── {id}/    │                     │  │
-│  │  │   └── files/        │  │    └── files/       │                     │  │
-│  │  └─────────────────────┘  └─────────────────────┘                     │  │
+│  │  ┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐    │  │
+│  │  │  Local Storage    │ │   SMB Storage     │ │    S3 Storage     │    │  │
+│  │  │  ./uploads/       │ │   \\server\share │ │    s3://bucket/    │    │  │
+│  │  │  ├── parts/       │ │   (parts local)   │ │    ├── parts/     │    │  │
+│  │  │  │   └── {id}/    │ │   files → SMB     │ │    │   └── {id}/  │    │  │
+│  │  │  └── files/       │ │                   │ │    └── files/     │    │  │
+│  │  └───────────────────┘ └───────────────────┘ └───────────────────┘    │  │
 │  │                         STORAGE LAYER                                 │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -186,7 +186,7 @@ The Chunked Upload Server is designed to handle large file uploads (10GB+) throu
 | chunk_size | INTEGER | Size of each chunk (default 50MB) |
 | total_parts | INTEGER | Number of chunks |
 | status | TEXT | pending / complete / failed |
-| storage_backend | TEXT | local / s3 |
+| storage_backend | TEXT | local / smb / s3 |
 | final_path | TEXT | Path to assembled file (after completion) |
 | checksum_sha256 | TEXT | Optional file checksum |
 | webhook_url | TEXT | URL to notify on completion |
@@ -289,6 +289,33 @@ s3://bucket/
 
 Assembly uses S3 multipart upload with `UploadPartCopy` for efficient server-side concatenation.
 
+### SMB/NAS Storage
+
+SMB storage uses a hybrid architecture for optimal performance:
+
+```
+Local Fast Storage (SSD)          SMB/NAS Server
+┌─────────────────────┐           ┌─────────────────────┐
+│ /tmp/chunked-uploads│           │ \\server\share      │
+│ └── parts/          │           │ └── files/          │
+│     └── {upload_id}/│  ──────▶  │     └── {id}_{name} │
+│         ├── part_0  │  (copy    │                     │
+│         ├── part_1  │   after   │                     │
+│         └── part_N  │  complete)│                     │
+└─────────────────────┘           └─────────────────────┘
+```
+
+**Architecture Benefits:**
+- Chunks stored on fast local SSD during upload (no network latency per chunk)
+- Final assembled file transferred to SMB after all parts complete
+- Automatic cleanup of local temporary files
+- Works with SMB 3.0+ servers (Synology, QNAP, TrueNAS, Windows, Samba)
+
+**SMB Connection:**
+- Uses pure Rust SMB client (no system mount required)
+- Supports SMB 3.0, 3.0.2, and 3.1.1 protocols
+- Authentication via username/password
+
 ## Background Services
 
 ### Cleanup Service
@@ -330,7 +357,14 @@ Assembly uses S3 multipart upload with `UploadPartCopy` for efficient server-sid
 |----------|---------|-------------|
 | `API_KEY` | *required* | Management endpoint authentication |
 | `JWT_SECRET` | *required* | JWT signing key |
-| `STORAGE_BACKEND` | `local` | `local` or `s3` |
+| `STORAGE_BACKEND` | `local` | `local`, `smb`, or `s3` |
+| `TEMP_STORAGE_PATH` | system temp | Local path for chunks (SMB mode) |
+| `SMB_HOST` | `localhost` | SMB server hostname/IP |
+| `SMB_PORT` | `445` | SMB server port |
+| `SMB_USER` | | SMB username |
+| `SMB_PASS` | | SMB password |
+| `SMB_SHARE` | `share` | SMB share name |
+| `SMB_PATH` | | Subdirectory within share |
 | `CHUNK_SIZE_MB` | `50` | Cloudflare-compatible default |
 | `UPLOAD_TTL_HOURS` | `24` | Auto-cleanup threshold |
 | `SERVER_PORT` | `3000` | HTTP listen port |
