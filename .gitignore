@@ -33,3 +33,6 @@ Thumbs.db
 
 tests/
 
+ChunkedUploader.app/
+run-chunked-uploader.sh
+

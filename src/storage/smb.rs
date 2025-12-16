@@ -27,7 +27,7 @@ pub struct SmbStorage {
     /// SMB connection info
     smb_config: SmbConfig,
     /// SMB client (protected by mutex for thread safety)
-    client: Arc<Mutex<Client>>,
+    client: Arc<Mutex<Option<Client>>>,
 }
 
 #[derive(Clone)]
@@ -98,8 +98,37 @@ impl SmbStorage {
         Ok(Self {
             parts_path,
             smb_config,
-            client: Arc::new(Mutex::new(client)),
+            client: Arc::new(Mutex::new(Some(client))),
         })
+    }
+
+    /// Get or reconnect SMB client
+    async fn get_or_reconnect_client(&self) -> Result<Client> {
+        let mut client_guard = self.client.lock().await;
+        
+        // Try to use existing client, but create new one if needed
+        if client_guard.is_none() {
+            tracing::info!("SMB client not connected, reconnecting...");
+            let new_client = Self::create_client(&self.smb_config).await?;
+            *client_guard = Some(new_client);
+        }
+        
+        // Clone the config for potential reconnection
+        let config = self.smb_config.clone();
+        
+        // Take the client out to use it
+        let client = client_guard.take().unwrap();
+        
+        // Return the client (caller is responsible for putting it back or creating new one)
+        drop(client_guard);
+        
+        Ok(client)
+    }
+
+    /// Return client to the pool or mark as disconnected
+    async fn return_client(&self, client: Option<Client>) {
+        let mut client_guard = self.client.lock().await;
+        *client_guard = client;
     }
 
     async fn create_client(config: &SmbConfig) -> Result<Client> {
@@ -373,58 +402,140 @@ impl StorageBackend for SmbStorage {
         })?;
         drop(temp_file);
 
-        // Step 2: Copy assembled file to SMB
+        // Step 2: Copy assembled file to SMB with retry/reconnect logic
         let temp_path = temp_assembled.clone();
         let smb_path_str = smb_file_path.clone();
-        let client_guard = self.client.lock().await;
-        let client = &*client_guard;
 
         let unc_path = UncPath::from_str(&self.smb_config.unc_path)
             .map_err(|e| AppError::Storage(format!("Invalid UNC path: {}", e)))?;
 
         let smb_path = unc_path.with_path(&smb_path_str);
 
-        // Read local file
-        let data = std::fs::read(&temp_path).map_err(|e| {
-            AppError::Storage(format!("Failed to read assembled file: {}", e))
-        })?;
+        // Get file size for progress tracking
+        let file_size = std::fs::metadata(&temp_path)
+            .map_err(|e| AppError::Storage(format!("Failed to get file size: {}", e)))?
+            .len();
 
-        // Write to SMB - overwrite if exists
-        let mut create_args = FileCreateArgs::make_overwrite(
-            FileAttributes::default(),
-            CreateOptions::default(),
-        );
-        create_args.desired_access = FileAccessMask::new().with_generic_write(true);
-
-        let resource = client
-            .create_file(&smb_path, &create_args)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to create SMB file: {}", e)))?;
-
-        match resource {
-            Resource::File(mut file) => {
-                let _written = file
-                    .write_at(&data, 0)
-                    .await
-                    .map_err(|e| AppError::Storage(format!("Failed to write to SMB: {}", e)))?;
-                file.close()
-                    .await
-                    .map_err(|e| AppError::Storage(format!("Failed to close SMB file: {}", e)))?;
+        // Try to write to SMB, with reconnection on failure
+        let mut last_error = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tracing::info!("Retrying SMB write, attempt {}/3", attempt + 1);
+                // Clear the stale client to force reconnection
+                self.return_client(None).await;
             }
-            _ => {
-                return Err(AppError::Storage("Expected file resource".to_string()));
+
+            let client = match self.get_or_reconnect_client().await {
+                Ok(c) => c,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
+            // Write to SMB - overwrite if exists
+            let mut create_args = FileCreateArgs::make_overwrite(
+                FileAttributes::default(),
+                CreateOptions::default(),
+            );
+            create_args.desired_access = FileAccessMask::new().with_generic_write(true);
+
+            match client.create_file(&smb_path, &create_args).await {
+                Ok(Resource::File(file)) => {
+                    // Use chunked writes for better performance with large files
+                    const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
+                    let mut local_file = match std::fs::File::open(&temp_path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            last_error = Some(AppError::Storage(format!("Failed to open temp file: {}", e)));
+                            continue;
+                        }
+                    };
+
+                    let mut offset = 0u64;
+                    let mut buffer = vec![0u8; CHUNK_SIZE];
+                    let mut write_success = true;
+                    let start_time = std::time::Instant::now();
+
+                    loop {
+                        use std::io::Read;
+                        let bytes_read = match local_file.read(&mut buffer) {
+                            Ok(0) => break, // EOF
+                            Ok(n) => n,
+                            Err(e) => {
+                                last_error = Some(AppError::Storage(format!("Failed to read temp file: {}", e)));
+                                write_success = false;
+                                break;
+                            }
+                        };
+
+                        match file.write_at(&buffer[..bytes_read], offset).await {
+                            Ok(written) => {
+                                offset += written as u64;
+                                // Log progress every 10MB
+                                if offset % (10 * 1024 * 1024) == 0 || offset == file_size {
+                                    let elapsed = start_time.elapsed().as_secs_f64();
+                                    let speed = if elapsed > 0.0 {
+                                        (offset as f64 / 1024.0 / 1024.0) / elapsed
+                                    } else {
+                                        0.0
+                                    };
+                                    tracing::debug!(
+                                        "SMB write progress: {:.1}MB / {:.1}MB ({:.1} MB/s)",
+                                        offset as f64 / 1024.0 / 1024.0,
+                                        file_size as f64 / 1024.0 / 1024.0,
+                                        speed
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("SMB write failed at offset {}: {}", offset, e);
+                                last_error = Some(AppError::Storage(format!("Failed to write to SMB: {}", e)));
+                                write_success = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if write_success {
+                        let elapsed = start_time.elapsed();
+                        let speed = (file_size as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64();
+                        tracing::info!(
+                            "SMB write complete: {:.1}MB in {:.1}s ({:.1} MB/s)",
+                            file_size as f64 / 1024.0 / 1024.0,
+                            elapsed.as_secs_f64(),
+                            speed
+                        );
+
+                        if let Err(e) = file.close().await {
+                            tracing::warn!("Failed to close SMB file: {}", e);
+                        }
+                        // Success - return client to pool
+                        self.return_client(Some(client)).await;
+                        
+                        // Step 3: Clean up local temp files
+                        fs::remove_file(&temp_assembled).await.ok();
+                        self.delete_parts(upload_id).await?;
+
+                        let full_path = format!("{}/{}", self.smb_config.unc_path, smb_file_path);
+                        tracing::info!("Assembled {} parts to SMB: {}", total_parts, full_path);
+                        return Ok(full_path);
+                    }
+                    // Write failed, don't return client
+                }
+                Ok(_) => {
+                    last_error = Some(AppError::Storage("Expected file resource".to_string()));
+                }
+                Err(e) => {
+                    tracing::warn!("SMB create_file failed: {}", e);
+                    last_error = Some(AppError::Storage(format!("Failed to create SMB file: {}", e)));
+                    // Don't return client - connection may be stale
+                }
             }
         }
 
-        // Step 3: Clean up local temp files
-        fs::remove_file(&temp_assembled).await.ok();
-        self.delete_parts(upload_id).await?;
-
-        let full_path = format!("{}/{}", self.smb_config.unc_path, smb_file_path);
-
-        tracing::info!("Assembled {} parts to SMB: {}", total_parts, full_path);
-
-        Ok(full_path)
+        // All retries failed
+        Err(last_error.unwrap_or_else(|| AppError::Storage("SMB operation failed after retries".to_string())))
     }
 
     async fn delete_parts(&self, upload_id: &str) -> Result<()> {
@@ -446,8 +557,8 @@ impl StorageBackend for SmbStorage {
         let unc_path = UncPath::from_str(path)
             .map_err(|e| AppError::Storage(format!("Invalid SMB path {}: {}", path, e)))?;
 
-        let client_guard = self.client.lock().await;
-        let client = &*client_guard;
+        // Try to get or reconnect client
+        let client = self.get_or_reconnect_client().await?;
 
         // Open file with delete access
         let delete_args = FileCreateArgs::make_open_existing(
@@ -458,6 +569,9 @@ impl StorageBackend for SmbStorage {
             file.close().await.ok();
             tracing::debug!("Deleted SMB file: {}", path);
         }
+
+        // Return client to pool
+        self.return_client(Some(client)).await;
 
         Ok(())
     }
