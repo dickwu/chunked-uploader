@@ -349,6 +349,172 @@ if __name__ == "__main__":
     upload_file(FILE_PATH, target_path="videos/2024/december")
 ```
 
+## JavaScript/TypeScript SDK
+
+Official SDK for browser and Node.js: [`chunked-uploader-sdk`](https://www.npmjs.com/package/chunked-uploader-sdk)
+
+### Features
+
+- **Large File Support**: Upload files of any size (10GB+)
+- **Automatic Chunking**: Files split into 50MB chunks (Cloudflare compatible)
+- **Parallel Uploads**: Configurable concurrency for faster uploads
+- **Resumable**: Continue interrupted uploads from where they left off
+- **Progress Tracking**: Real-time progress callbacks
+- **Retry Logic**: Automatic retry for failed chunks
+- **TypeScript**: Full type definitions included
+- **Isomorphic**: Works in both browser and Node.js
+
+### Installation
+
+```bash
+npm install chunked-uploader-sdk
+```
+
+### Quick Start
+
+```typescript
+import { ChunkedUploader } from 'chunked-uploader-sdk';
+
+const uploader = new ChunkedUploader({
+  baseUrl: 'https://upload.example.com',
+  apiKey: 'your-api-key',
+});
+
+// Upload a file with progress tracking
+const result = await uploader.uploadFile(file, {
+  onProgress: (event) => {
+    console.log(`Progress: ${event.overallProgress.toFixed(1)}%`);
+  },
+});
+
+if (result.success) {
+  console.log('Upload complete:', result.finalPath);
+} else {
+  console.error('Upload failed:', result.error);
+}
+```
+
+### Browser Example
+
+```typescript
+const uploader = new ChunkedUploader({
+  baseUrl: 'http://localhost:3000',
+  apiKey: 'your-api-key',
+});
+
+// File input handler
+const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+input.addEventListener('change', async () => {
+  const file = input.files?.[0];
+  if (!file) return;
+
+  const result = await uploader.uploadFile(file, {
+    concurrency: 5, // Upload 5 parts simultaneously
+    onProgress: (event) => {
+      progressBar.style.width = `${event.overallProgress}%`;
+      statusText.textContent = `Uploading part ${event.uploadedParts}/${event.totalParts}`;
+    },
+    onPartComplete: (result) => {
+      if (!result.success) {
+        console.error(`Part ${result.partNumber} failed:`, result.error);
+      }
+    },
+  });
+
+  console.log(result);
+});
+```
+
+### Resume Interrupted Upload
+
+```typescript
+// Store part tokens from initial upload
+const tokenMap = new Map<number, string>();
+initResponse.parts.forEach(p => tokenMap.set(p.part, p.token));
+
+// Later, resume the upload
+const result = await uploader.resumeUpload(uploadId, file, {
+  partTokens: tokenMap,
+  onProgress: (event) => console.log(`${event.overallProgress}%`),
+});
+```
+
+### Cancellable Upload
+
+```typescript
+const abortController = new AbortController();
+
+// Cancel button
+cancelButton.addEventListener('click', () => {
+  abortController.abort();
+});
+
+const result = await uploader.uploadFile(file, {
+  signal: abortController.signal,
+});
+
+if (!result.success && result.error?.message === 'Upload aborted') {
+  console.log('Upload was cancelled');
+}
+```
+
+### Node.js Usage
+
+```typescript
+import { ChunkedUploader } from 'chunked-uploader-sdk';
+import { readFile } from 'fs/promises';
+
+const uploader = new ChunkedUploader({
+  baseUrl: 'http://localhost:3000',
+  apiKey: 'your-api-key',
+  concurrency: 5,
+});
+
+async function uploadFromDisk(filePath: string) {
+  const buffer = await readFile(filePath);
+  const result = await uploader.uploadFile(buffer, {
+    onProgress: (event) => {
+      process.stdout.write(`\rProgress: ${event.overallProgress.toFixed(1)}%`);
+    },
+  });
+  console.log('\nUpload complete:', result);
+}
+```
+
+### Configuration Options
+
+```typescript
+interface ChunkedUploaderConfig {
+  /** Base URL of the chunked upload server */
+  baseUrl: string;
+  /** API key for management endpoints */
+  apiKey: string;
+  /** Request timeout in milliseconds (default: 30000) */
+  timeout?: number;
+  /** Number of concurrent chunk uploads (default: 3) */
+  concurrency?: number;
+  /** Retry attempts for failed chunks (default: 3) */
+  retryAttempts?: number;
+  /** Delay between retries in milliseconds (default: 1000) */
+  retryDelay?: number;
+  /** Custom fetch implementation */
+  fetch?: typeof fetch;
+}
+```
+
+### SDK Methods
+
+| Method | Description |
+|--------|-------------|
+| `uploadFile(file, options?)` | Upload a file with automatic chunking and parallel uploads |
+| `resumeUpload(uploadId, file, options?)` | Resume an interrupted upload |
+| `initUpload(filename, totalSize, webhookUrl?)` | Initialize an upload session manually |
+| `uploadPart(uploadId, partNumber, token, data, signal?)` | Upload a single chunk |
+| `getStatus(uploadId)` | Get upload progress and status |
+| `completeUpload(uploadId)` | Complete an upload (assemble all parts) |
+| `cancelUpload(uploadId)` | Cancel an upload and cleanup |
+| `healthCheck()` | Check server health |
+
 ## Scripts Reference
 
 | Script | Description |
