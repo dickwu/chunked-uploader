@@ -40,4 +40,11 @@ pub trait StorageBackend: Send + Sync {
 
     /// Get the backend type name
     fn backend_type(&self) -> &'static str;
+    
+    /// Check if backend is healthy (connected and writable)
+    /// Returns (is_healthy, optional_message)
+    async fn health_check(&self) -> (bool, Option<String>) {
+        // Default implementation assumes healthy
+        (true, None)
+    }
 }

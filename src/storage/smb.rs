@@ -6,8 +6,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use smb::{
-    Client, ClientConfig, CreateOptions, Dialect, FileAccessMask, FileAttributes, FileCreateArgs, Resource,
-    UncPath, WriteAt,
+    Client, ClientConfig, CreateDisposition, CreateOptions, Dialect, FileAccessMask, FileAttributes,
+    FileCreateArgs, Resource, UncPath, WriteAt,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,9 @@ struct SmbConfig {
 }
 
 impl SmbStorage {
+    /// Create SmbStorage with lazy connection.
+    /// Connection is established on first use, not during initialization.
+    /// This allows the app to start even when SMB server is temporarily unavailable.
     pub async fn new(config: &Config, temp_storage_path: &str) -> Result<Self> {
         let parts_path = PathBuf::from(temp_storage_path).join("parts");
 
@@ -69,7 +72,7 @@ impl SmbStorage {
             base_path,
         };
 
-        tracing::info!("Initializing SmbStorage...");
+        tracing::info!("Initializing SmbStorage (lazy connection)...");
         tracing::info!("  SMB: {}", smb_config.unc_path);
         tracing::info!("  User: {}", config.smb_user);
         tracing::info!("  Base path: {}", smb_config.base_path);
@@ -82,24 +85,38 @@ impl SmbStorage {
         // Test local write permission
         Self::verify_local_write(&parts_path)?;
 
-        // Create and connect SMB client
-        let client = Self::create_client(&smb_config).await?;
-
-        // Create files directory on SMB
-        Self::ensure_smb_dir(&client, &smb_config).await?;
-
-        // Test SMB write
-        Self::verify_smb_write(&client, &smb_config).await?;
-
-        tracing::info!("SmbStorage initialized:");
+        tracing::info!("SmbStorage initialized (connection deferred):");
         tracing::info!("  ✓ Parts (local): {}", parts_path.display());
-        tracing::info!("  ✓ Files (SMB): {}/{}", smb_config.unc_path, smb_config.base_path);
+        tracing::info!("  ◦ Files (SMB): {}/{} (will connect on first use)", smb_config.unc_path, smb_config.base_path);
 
+        // Don't connect now - defer to first use
+        // This allows app to start even when SMB is unreachable
         Ok(Self {
             parts_path,
             smb_config,
-            client: Arc::new(Mutex::new(Some(client))),
+            client: Arc::new(Mutex::new(None)),
         })
+    }
+    
+    /// Try to establish connection if not connected.
+    /// Returns true if connected, false if connection failed.
+    pub async fn try_connect(&self) -> bool {
+        let client_guard = self.client.lock().await;
+        if client_guard.is_some() {
+            return true;
+        }
+        drop(client_guard);
+        
+        match self.get_or_reconnect_client().await {
+            Ok(client) => {
+                self.return_client(Some(client)).await;
+                true
+            }
+            Err(e) => {
+                tracing::warn!("SMB connection failed: {}", e);
+                false
+            }
+        }
     }
 
     /// Get or reconnect SMB client
@@ -113,8 +130,8 @@ impl SmbStorage {
             *client_guard = Some(new_client);
         }
         
-        // Clone the config for potential reconnection
-        let config = self.smb_config.clone();
+        // Keep config available for potential reconnection (currently unused but reserved)
+        let _config = self.smb_config.clone();
         
         // Take the client out to use it
         let client = client_guard.take().unwrap();
@@ -198,37 +215,76 @@ impl SmbStorage {
 
     async fn ensure_smb_dir(client: &Client, config: &SmbConfig) -> Result<()> {
         // Create directory recursively
+        // with_path() takes the full path at once, so we build cumulative paths
         let parts: Vec<&str> = config.base_path.split('/').filter(|s| !s.is_empty()).collect();
         let unc_path = UncPath::from_str(&config.unc_path)
             .map_err(|e| AppError::Storage(format!("Invalid UNC path: {}", e)))?;
 
-        let mut current_path = unc_path.clone();
+        let mut cumulative_path = String::new();
 
         for part in parts {
-            current_path = current_path.with_path(part);
+            // Build cumulative path: "Sermons", then "Sermons/files"
+            if cumulative_path.is_empty() {
+                cumulative_path = part.to_string();
+            } else {
+                cumulative_path = format!("{}/{}", cumulative_path, part);
+            }
+            
+            // with_path takes the full path string
+            let current_path = unc_path.clone().with_path(&cumulative_path);
 
-            // Try to open as directory
+            // Try to open as directory first
             let open_args = FileCreateArgs::make_open_existing(
                 FileAccessMask::new().with_generic_read(true),
             );
 
             match client.create_file(&current_path, &open_args).await {
-                Ok(Resource::Directory(_)) => {
+                Ok(Resource::Directory(dir)) => {
                     // Directory exists
-                    tracing::debug!("SMB directory exists: {}", part);
+                    tracing::debug!("SMB directory exists: {}", cumulative_path);
+                    dir.close().await.ok();
                 }
                 Ok(Resource::File(_)) => {
                     return Err(AppError::Storage(format!(
                         "Path exists but is a file, not directory: {}",
-                        part
+                        cumulative_path
                     )));
                 }
                 Err(_) => {
-                    // Directory doesn't exist, try to create it
-                    // Note: smb-rs may not have direct mkdir, we'll need to check API
-                    // For now, we'll create it by trying to open/create a file in it
-                    tracing::debug!("Creating SMB directory: {}", part);
-                    // Directory creation will happen implicitly when we create files
+                    // Directory doesn't exist - create it
+                    tracing::info!("Creating SMB directory: {}", cumulative_path);
+                    let create_args = FileCreateArgs {
+                        desired_access: FileAccessMask::new().with_generic_write(true),
+                        attributes: FileAttributes::new().with_directory(true),
+                        disposition: CreateDisposition::Create,
+                        options: CreateOptions::new().with_directory_file(true),
+                        ..Default::default()
+                    };
+
+                    match client.create_file(&current_path, &create_args).await {
+                        Ok(Resource::Directory(dir)) => {
+                            tracing::info!("Created SMB directory: {}", cumulative_path);
+                            dir.close().await.ok();
+                        }
+                        Ok(_) => {
+                            return Err(AppError::Storage(format!(
+                                "Failed to create directory {}: unexpected resource type",
+                                cumulative_path
+                            )));
+                        }
+                        Err(e) => {
+                            // Check if it's "already exists" error (race condition) - that's OK
+                            let err_str = e.to_string().to_lowercase();
+                            if err_str.contains("exists") || err_str.contains("object name collision") {
+                                tracing::debug!("SMB directory already exists (race condition): {}", cumulative_path);
+                            } else {
+                                return Err(AppError::Storage(format!(
+                                    "Failed to create SMB directory {}: {}",
+                                    cumulative_path, e
+                                )));
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -241,7 +297,9 @@ impl SmbStorage {
         let unc_path = UncPath::from_str(&config.unc_path)
             .map_err(|e| AppError::Storage(format!("Invalid UNC path: {}", e)))?;
 
-        let test_path = unc_path.with_path(&format!("{}/.write_test", config.base_path));
+        // with_path takes the full path at once
+        let test_file_path = format!("{}/.write_test", config.base_path);
+        let test_path = unc_path.clone().with_path(&test_file_path);
 
         // Create test file - overwrite if exists
         let mut create_args = FileCreateArgs::make_overwrite(
@@ -256,7 +314,7 @@ impl SmbStorage {
             .map_err(|e| AppError::Storage(format!("SMB write test failed: {}", e)))?;
 
         match resource {
-            Resource::File(mut file) => {
+            Resource::File(file) => {
                 let _written = file
                     .write_at(b"test", 0)
                     .await
@@ -273,7 +331,7 @@ impl SmbStorage {
             FileAccessMask::new().with_delete(true),
         );
 
-        if let Ok(Resource::File(mut file)) = client.create_file(&test_path, &delete_args).await {
+        if let Ok(Resource::File(file)) = client.create_file(&test_path, &delete_args).await {
             file.close().await.ok();
         }
 
@@ -297,7 +355,15 @@ impl SmbStorage {
             .and_then(|n| n.to_str())
             .unwrap_or("unnamed");
 
+        // Return slash-separated path components - will be processed by build_smb_path
         format!("{}/{}_{}", self.smb_config.base_path, upload_id, safe_filename)
+    }
+
+    /// Build a UncPath by appending the full path string
+    /// with_path() takes the entire path at once, not one component at a time
+    fn build_smb_path(unc_path: &UncPath, path_str: &str) -> UncPath {
+        // with_path expects the full path in one call
+        unc_path.clone().with_path(path_str)
     }
 }
 
@@ -409,7 +475,7 @@ impl StorageBackend for SmbStorage {
         let unc_path = UncPath::from_str(&self.smb_config.unc_path)
             .map_err(|e| AppError::Storage(format!("Invalid UNC path: {}", e)))?;
 
-        let smb_path = unc_path.with_path(&smb_path_str);
+        let smb_path = Self::build_smb_path(&unc_path, &smb_path_str);
 
         // Get file size for progress tracking
         let file_size = std::fs::metadata(&temp_path)
@@ -432,6 +498,13 @@ impl StorageBackend for SmbStorage {
                     continue;
                 }
             };
+
+            // Ensure target directory exists on SMB share
+            if let Err(e) = Self::ensure_smb_dir(&client, &self.smb_config).await {
+                tracing::warn!("Failed to ensure SMB directory: {}", e);
+                last_error = Some(e);
+                continue;
+            }
 
             // Write to SMB - overwrite if exists
             let mut create_args = FileCreateArgs::make_overwrite(
@@ -517,9 +590,23 @@ impl StorageBackend for SmbStorage {
                         fs::remove_file(&temp_assembled).await.ok();
                         self.delete_parts(upload_id).await?;
 
+                        // Return relative path (files/uuid_filename) for API consumer
+                        // Full UNC path is logged for debugging only
                         let full_path = format!("{}/{}", self.smb_config.unc_path, smb_file_path);
                         tracing::info!("Assembled {} parts to SMB: {}", total_parts, full_path);
-                        return Ok(full_path);
+                        
+                        // Extract just the files/... portion for the response
+                        let relative_path = if smb_file_path.contains("/files/") {
+                            // Path like "Sermons/files/uuid_filename" -> "files/uuid_filename"
+                            format!("files/{}", smb_file_path.rsplit("/files/").next().unwrap_or(&smb_file_path))
+                        } else if smb_file_path.starts_with("files/") {
+                            // Path already is "files/uuid_filename"
+                            smb_file_path.clone()
+                        } else {
+                            // Fallback to full relative path
+                            smb_file_path.clone()
+                        };
+                        return Ok(relative_path);
                     }
                     // Write failed, don't return client
                 }
@@ -565,7 +652,7 @@ impl StorageBackend for SmbStorage {
             FileAccessMask::new().with_delete(true),
         );
 
-        if let Ok(Resource::File(mut file)) = client.create_file(&unc_path, &delete_args).await {
+        if let Ok(Resource::File(file)) = client.create_file(&unc_path, &delete_args).await {
             file.close().await.ok();
             tracing::debug!("Deleted SMB file: {}", path);
         }
@@ -578,5 +665,31 @@ impl StorageBackend for SmbStorage {
 
     fn backend_type(&self) -> &'static str {
         "smb"
+    }
+    
+    async fn health_check(&self) -> (bool, Option<String>) {
+        // Check if we have an active connection
+        let has_client = {
+            let guard = self.client.lock().await;
+            guard.is_some()
+        };
+        
+        if has_client {
+            return (true, Some("SMB connected".to_string()));
+        }
+        
+        // Try to establish connection
+        match Self::create_client(&self.smb_config).await {
+            Ok(client) => {
+                // Connection succeeded, store it
+                self.return_client(Some(client)).await;
+                (true, Some("SMB connection established".to_string()))
+            }
+            Err(e) => {
+                let msg = format!("SMB unavailable: {} ({}:{})", 
+                    e, self.smb_config.host, self.smb_config.port);
+                (false, Some(msg))
+            }
+        }
     }
 }

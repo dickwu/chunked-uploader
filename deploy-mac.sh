@@ -153,28 +153,32 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
 fi
 
 # Create a standalone launcher script that will be executed by launchd
-# This script uses `open -W -a` to launch the app in GUI session context
+# Runs the binary directly with environment variables from .env
 LAUNCHER_SCRIPT="$SCRIPT_DIR/run-chunked-uploader.sh"
-cat > "$LAUNCHER_SCRIPT" << EOF
+cat > "$LAUNCHER_SCRIPT" << 'SCRIPT_EOF'
 #!/bin/bash
 # Launcher script for ChunkedUploader
-# Uses open -W -a to launch in GUI context
-# Environment variables are embedded in the app's Info.plist via LSEnvironment
+# Runs the binary directly with environment loaded
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Launch the app using open -W -a
-# This runs the process in GUI session context, bypassing macOS Tahoe's 
-# local network restrictions for launchd processes
-exec /usr/bin/open -W -a "$APP_PATH"
-EOF
+# Load environment variables from .env if it exists
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+# Run the binary directly
+exec "$SCRIPT_DIR/target/release/chunked-uploader"
+SCRIPT_EOF
 chmod +x "$LAUNCHER_SCRIPT"
 
 echo "Created launcher script: $LAUNCHER_SCRIPT"
 
 # Create the launchd plist file
-# We run the launcher script which then uses `open -W -a` to launch the app
-# The app binary reads environment from the process environment
+# Runs the binary directly with environment variables set in the plist
 cat > "$PLIST_PATH" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -185,6 +189,7 @@ cat > "$PLIST_PATH" << EOF
     
     <key>ProgramArguments</key>
     <array>
+        <string>/bin/bash</string>
         <string>$LAUNCHER_SCRIPT</string>
     </array>
     
