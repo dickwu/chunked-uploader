@@ -349,14 +349,31 @@ impl SmbStorage {
         self.parts_path.join(upload_id)
     }
 
-    fn get_smb_file_path(&self, upload_id: &str, filename: &str) -> String {
+    fn get_smb_file_path(&self, upload_id: &str, filename: &str, target_path: Option<&str>) -> String {
         let safe_filename = Path::new(filename)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unnamed");
 
-        // Return slash-separated path components - will be processed by build_smb_path
-        format!("{}/{}_{}", self.smb_config.base_path, upload_id, safe_filename)
+        let final_filename = format!("{}_{}", upload_id, safe_filename);
+
+        // Use custom path if provided, otherwise use base_path
+        match target_path {
+            Some(path) => {
+                let clean_path: String = path
+                    .trim_matches('/')
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_')
+                    .collect();
+                
+                if clean_path.is_empty() {
+                    format!("{}/{}", self.smb_config.base_path, final_filename)
+                } else {
+                    format!("{}/{}/{}", self.smb_config.base_path, clean_path, final_filename)
+                }
+            }
+            None => format!("{}/{}", self.smb_config.base_path, final_filename),
+        }
     }
 
     /// Build a UncPath by appending the full path string
@@ -425,8 +442,9 @@ impl StorageBackend for SmbStorage {
         upload_id: &str,
         filename: &str,
         total_parts: i32,
+        target_path: Option<&str>,
     ) -> Result<String> {
-        let smb_file_path = self.get_smb_file_path(upload_id, filename);
+        let smb_file_path = self.get_smb_file_path(upload_id, filename, target_path);
         let parts_path = self.parts_path.clone();
         let upload_id_owned = upload_id.to_string();
 

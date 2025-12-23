@@ -25,11 +25,13 @@ pub trait StorageBackend: Send + Sync {
     async fn read_part(&self, upload_id: &str, part_number: i32) -> Result<Bytes>;
 
     /// Assemble all parts into a final file
+    /// target_path is an optional custom path prefix (e.g., "videos/2024/")
     async fn assemble_parts(
         &self,
         upload_id: &str,
         filename: &str,
         total_parts: i32,
+        target_path: Option<&str>,
     ) -> Result<String>;
 
     /// Delete all parts for an upload

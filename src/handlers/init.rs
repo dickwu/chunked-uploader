@@ -9,7 +9,7 @@ use crate::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct InitUploadRequest {
-    pub filename: String,
+    pub filename: String,  // Can include path: "videos/2024/movie.mp4"
     pub total_size: i64,
     #[serde(default)]
     pub checksum_sha256: Option<String>,
@@ -54,10 +54,30 @@ pub async fn init_upload(
     let expires_at = now + chrono::Duration::hours(state.config.upload_ttl_hours as i64);
     let expires_timestamp = expires_at.timestamp();
 
+    // Extract path and filename from the provided filename
+    // e.g., "videos/2024/movie.mp4" -> path: "videos/2024", filename: "movie.mp4"
+    let (target_path, actual_filename) = {
+        let path = std::path::Path::new(&request.filename);
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&request.filename)
+            .to_string();
+        
+        let parent = path
+            .parent()
+            .and_then(|p| p.to_str())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string());
+        
+        (parent, filename)
+    };
+
     tracing::info!(
-        "Initializing upload: id={}, filename={}, size={}, parts={}",
+        "Initializing upload: id={}, filename={}, path={:?}, size={}, parts={}",
         upload_id,
-        request.filename,
+        actual_filename,
+        target_path,
         request.total_size,
         total_parts
     );
@@ -65,12 +85,13 @@ pub async fn init_upload(
     // Create upload record
     let upload = Upload {
         id: upload_id.clone(),
-        filename: request.filename.clone(),
+        filename: actual_filename,
         total_size: request.total_size,
         chunk_size,
         total_parts,
         status: UploadStatus::Pending,
         storage_backend: state.storage.backend_type().to_string(),
+        target_path,
         final_path: None,
         checksum_sha256: request.checksum_sha256,
         webhook_url: request.webhook_url,

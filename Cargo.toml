@@ -1,6 +1,6 @@
 [package]
 name = "chunked-uploader"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A resumable chunked upload server supporting large files (>10GB) with Cloudflare compatibility"
 license = "MIT"
@@ -62,6 +62,10 @@ bytes = "1"
 
 # HTTP client for webhooks
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+hex = "0.4"
 
 [profile.release]
 lto = true

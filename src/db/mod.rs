@@ -40,6 +40,7 @@ impl Database {
                 total_parts INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 storage_backend TEXT NOT NULL,
+                target_path TEXT,
                 final_path TEXT,
                 checksum_sha256 TEXT,
                 webhook_url TEXT,
@@ -51,8 +52,9 @@ impl Database {
             [],
         )?;
 
-        // Add webhook_url column if it doesn't exist (migration for existing DBs)
+        // Add columns if they don't exist (migrations for existing DBs)
         let _ = conn.execute("ALTER TABLE uploads ADD COLUMN webhook_url TEXT", []);
+        let _ = conn.execute("ALTER TABLE uploads ADD COLUMN target_path TEXT", []);
 
         // Create upload_parts table
         conn.execute(

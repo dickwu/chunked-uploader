@@ -75,7 +75,7 @@ pub async fn complete_upload(
     // Assemble the parts
     let final_path = state
         .storage
-        .assemble_parts(&upload_id, &upload.filename, upload.total_parts)
+        .assemble_parts(&upload_id, &upload.filename, upload.total_parts, upload.target_path.as_deref())
         .await?;
 
     // Update database

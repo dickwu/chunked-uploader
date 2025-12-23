@@ -9,6 +9,7 @@ A production-ready Rust HTTP server supporting **resumable chunked uploads** for
 - **Cloudflare Compatible**: 50MB default chunk size fits within Cloudflare's request limits
 - **JWT-based Part Authentication**: Each chunk has its own secure token
 - **Multiple Storage Backends**: Local filesystem, SMB/NAS, or S3-compatible storage
+- **Custom Paths**: Include path in filename (e.g., `videos/2024/movie.mp4`) to organize files
 - **Auto Cleanup**: Expired incomplete uploads are automatically cleaned up
 - **Progress Tracking**: Real-time upload progress via SQLite persistence
 
@@ -20,6 +21,7 @@ A production-ready Rust HTTP server supporting **resumable chunked uploads** for
 └─────────────────────────────────────────────────────────────────┘
                               │
               1. POST /upload/init (API Key)
+              │ filename: "videos/2024/movie.mp4"
               │ Returns: file_id + JWT tokens for each part
               ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -115,6 +117,18 @@ curl -X POST http://localhost:3000/upload/init \
   }'
 ```
 
+**With custom path** (path is extracted from filename):
+```bash
+curl -X POST http://localhost:3000/upload/init \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "filename": "videos/2024/december/large-video.mp4",
+    "total_size": 10737418240
+  }'
+```
+This will store the file at `videos/2024/december/uuid_large-video.mp4`
+
 Response:
 ```json
 {
@@ -199,6 +213,18 @@ Response:
 }
 ```
 
+With S3 backend (and path in filename):
+```json
+{
+  "file_id": "550e8400-e29b-41d4-a716-446655440000",
+  "filename": "large-video.mp4",
+  "total_size": 10737418240,
+  "status": "complete",
+  "final_path": "s3://my-bucket/videos/2024/december/550e8400..._large-video.mp4",
+  "storage_backend": "s3"
+}
+```
+
 ### 7. Cancel Upload (optional)
 
 ```bash
@@ -225,7 +251,7 @@ curl -X DELETE "http://localhost:3000/upload/${FILE_ID}" \
 | `JWT_SECRET` | *required* | Secret for JWT token signing |
 | `STORAGE_BACKEND` | `local` | `local`, `smb`, or `s3` |
 | `LOCAL_STORAGE_PATH` | `./uploads` | Path for local storage |
-| `TEMP_STORAGE_PATH` | system temp | Local path for temporary chunk storage (fast SSD recommended) |
+| `TEMP_STORAGE_PATH` | system temp | Local path for temporary chunk storage (fast SSD recommended). Used by S3 and SMB backends. |
 | `SMB_HOST` | `localhost` | SMB server hostname or IP |
 | `SMB_PORT` | `445` | SMB server port |
 | `SMB_USER` | | SMB username |
@@ -260,15 +286,25 @@ BASE_URL = "http://localhost:3000"
 FILE_PATH = "large-file.zip"
 CHUNK_SIZE = 50 * 1024 * 1024  # 50MB
 
-def upload_file(file_path):
+def upload_file(file_path, target_path=None):
+    """
+    Upload a file to the chunked upload server.
+    
+    Args:
+        file_path: Local path to the file
+        target_path: Optional remote path (e.g., "videos/2024")
+    """
     file_size = os.path.getsize(file_path)
     filename = os.path.basename(file_path)
+    
+    # Include target path in filename if specified
+    remote_filename = f"{target_path}/{filename}" if target_path else filename
     
     # 1. Initialize upload
     resp = requests.post(
         f"{BASE_URL}/upload/init",
         headers={"X-API-Key": API_KEY},
-        json={"filename": filename, "total_size": file_size}
+        json={"filename": remote_filename, "total_size": file_size}
     )
     data = resp.json()
     file_id = data["file_id"]
@@ -306,7 +342,11 @@ def upload_file(file_path):
     print(f"Upload complete: {resp.json()['final_path']}")
 
 if __name__ == "__main__":
+    # Simple upload (file goes to default location)
     upload_file(FILE_PATH)
+    
+    # Upload to specific path
+    upload_file(FILE_PATH, target_path="videos/2024/december")
 ```
 
 ## Scripts Reference
@@ -412,6 +452,41 @@ S3_BUCKET=my-uploads
 S3_REGION=us-east-1
 AWS_ACCESS_KEY_ID=your-access-key
 AWS_SECRET_ACCESS_KEY=your-secret-key
+
+# Optional: Fast local storage for temporary chunks (recommended)
+TEMP_STORAGE_PATH=/tmp/chunked-uploads
+```
+
+### S3 Storage Architecture
+
+The S3 backend uses a hybrid approach for optimal performance:
+
+1. **Chunks are stored locally** on fast storage (SSD) during upload
+2. **Final assembled file is uploaded to S3** after all chunks complete
+3. **Automatic cleanup** of local temporary files
+
+This design ensures:
+- Fast chunk uploads (no network latency per chunk)
+- No S3 multipart upload complexity or minimum part size restrictions
+- Reliable large file transfers to S3
+- Works with any S3-compatible storage (AWS S3, MinIO, Cloudflare R2, etc.)
+
+### Building with S3 Support
+
+```bash
+# Build with S3 feature
+cargo build --release --features s3
+```
+
+### Running S3 Tests
+
+```bash
+# Ensure .env has S3 credentials configured
+# Start server with S3 backend
+cargo run --features s3
+
+# Run integration tests (in another terminal)
+cargo test --features s3 --test s3_upload_test -- --nocapture --test-threads=1
 ```
 
 ## SMB/NAS Storage Setup

@@ -81,14 +81,33 @@ impl LocalStorage {
         self.parts_path.join(upload_id)
     }
 
-    fn get_final_file_path(&self, upload_id: &str, filename: &str) -> PathBuf {
+    fn get_final_file_path(&self, upload_id: &str, filename: &str, target_path: Option<&str>) -> PathBuf {
         // Sanitize filename to prevent path traversal
         let safe_filename = Path::new(filename)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unnamed");
 
-        self.final_path.join(format!("{}_{}", upload_id, safe_filename))
+        let final_filename = format!("{}_{}", upload_id, safe_filename);
+
+        // Use custom path if provided
+        match target_path {
+            Some(path) => {
+                // Sanitize path (remove leading slashes, prevent traversal)
+                let clean_path: String = path
+                    .trim_matches('/')
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_')
+                    .collect();
+                
+                if clean_path.is_empty() {
+                    self.final_path.join(&final_filename)
+                } else {
+                    self.final_path.join(&clean_path).join(&final_filename)
+                }
+            }
+            None => self.final_path.join(&final_filename),
+        }
     }
 }
 
@@ -152,10 +171,18 @@ impl StorageBackend for LocalStorage {
         upload_id: &str,
         filename: &str,
         total_parts: i32,
+        target_path: Option<&str>,
     ) -> Result<String> {
-        let final_path = self.get_final_file_path(upload_id, filename);
+        let final_path = self.get_final_file_path(upload_id, filename, target_path);
         let parts_path = self.parts_path.clone();
         let upload_id_owned = upload_id.to_string();
+
+        // Create target directory if needed
+        if let Some(parent) = final_path.parent() {
+            fs::create_dir_all(parent).await.map_err(|e| {
+                AppError::Storage(format!("Failed to create target directory: {}", e))
+            })?;
+        }
 
         tracing::info!(
             "Assembling {} parts for upload {} to {:?}",

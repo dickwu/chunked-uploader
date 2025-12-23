@@ -16,7 +16,7 @@ cargo update
 
 echo "Building release binary..."
 # Include SMB support (pure Rust, no C dependencies needed)
-cargo build --release --features smb
+cargo build --release --features s3
 if [ $? -ne 0 ]; then
     echo "Build failed!"
     exit 1

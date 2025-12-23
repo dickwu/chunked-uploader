@@ -1,9 +1,17 @@
+//! S3 Storage Backend
+//!
+//! Uses local fast storage for parts, then uploads final assembled file to S3.
+//! This avoids S3 multipart upload complexity and minimum part size restrictions.
+
 #![cfg(feature = "s3")]
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client};
 use bytes::Bytes;
+use std::path::PathBuf;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 use super::StorageBackend;
 use crate::config::Config;
@@ -12,6 +20,8 @@ use crate::error::{AppError, Result};
 pub struct S3Storage {
     client: Client,
     bucket: String,
+    /// Local temp storage for parts (fast SSD)
+    parts_path: PathBuf,
 }
 
 impl S3Storage {
@@ -28,26 +38,63 @@ impl S3Storage {
         let sdk_config = aws_config.load().await;
         let client = Client::new(&sdk_config);
 
-        tracing::info!("S3Storage initialized for bucket: {}", config.s3_bucket);
+        // Use temp storage path for parts (like SMB does)
+        let parts_path = PathBuf::from(&config.temp_storage_path).join("parts");
+        
+        // Create local parts directory
+        std::fs::create_dir_all(&parts_path)
+            .map_err(|e| AppError::Storage(format!("Failed to create parts directory: {}", e)))?;
+
+        tracing::info!("S3Storage initialized:");
+        tracing::info!("  Bucket: {}", config.s3_bucket);
+        tracing::info!("  Region: {}", config.s3_region);
+        if let Some(endpoint) = &config.s3_endpoint {
+            tracing::info!("  Endpoint: {}", endpoint);
+        }
+        tracing::info!("  Local parts: {}", parts_path.display());
 
         Ok(Self {
             client,
             bucket: config.s3_bucket.clone(),
+            parts_path,
         })
     }
 
-    fn get_part_key(&self, upload_id: &str, part_number: i32) -> String {
-        format!(".parts/{}/part_{:06}", upload_id, part_number)
+    fn get_part_path(&self, upload_id: &str, part_number: i32) -> PathBuf {
+        self.parts_path
+            .join(upload_id)
+            .join(format!("part_{:06}", part_number))
     }
 
-    fn get_final_key(&self, upload_id: &str, filename: &str) -> String {
+    fn get_upload_parts_dir(&self, upload_id: &str) -> PathBuf {
+        self.parts_path.join(upload_id)
+    }
+
+    fn get_final_key(&self, upload_id: &str, filename: &str, target_path: Option<&str>) -> String {
         // Sanitize filename
         let safe_filename = filename
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
             .collect::<String>();
 
-        format!("files/{}_{}", upload_id, safe_filename)
+        // Use custom path if provided, otherwise default to "files/"
+        match target_path {
+            Some(path) => {
+                // Sanitize and normalize path (remove leading/trailing slashes)
+                let clean_path = path
+                    .trim_matches('/')
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_')
+                    .collect::<String>();
+                
+                if clean_path.is_empty() {
+                    format!("{}_{}", upload_id, safe_filename)
+                } else {
+                    format!("{}/{}_{}", clean_path, upload_id, safe_filename)
+                }
+            }
+            None => format!("files/{}_{}", upload_id, safe_filename),
+        }
     }
 }
 
@@ -59,41 +106,49 @@ impl StorageBackend for S3Storage {
         part_number: i32,
         data: Bytes,
     ) -> Result<String> {
-        let key = self.get_part_key(upload_id, part_number);
+        let part_path = self.get_part_path(upload_id, part_number);
+        let data_len = data.len();
 
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(ByteStream::from(data.to_vec()))
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to upload part to S3: {}", e)))?;
+        // Parts go to local temp storage - use async I/O
+        if let Some(parent) = part_path.parent() {
+            fs::create_dir_all(parent).await.map_err(|e| {
+                AppError::Storage(format!("Failed to create upload directory: {}", e))
+            })?;
+        }
 
-        tracing::debug!("Stored part {} for upload {} to S3", part_number, upload_id);
+        let mut file = fs::File::create(&part_path).await.map_err(|e| {
+            AppError::Storage(format!("Failed to create part file: {}", e))
+        })?;
 
-        Ok(key)
+        file.write_all(&data).await.map_err(|e| {
+            AppError::Storage(format!("Failed to write part data: {}", e))
+        })?;
+
+        file.flush().await.map_err(|e| {
+            AppError::Storage(format!("Failed to flush part data: {}", e))
+        })?;
+
+        tracing::debug!(
+            "Stored part {} for upload {} ({} bytes) locally",
+            part_number,
+            upload_id,
+            data_len
+        );
+
+        Ok(part_path.to_string_lossy().to_string())
     }
 
     async fn read_part(&self, upload_id: &str, part_number: i32) -> Result<Bytes> {
-        let key = self.get_part_key(upload_id, part_number);
+        let part_path = self.get_part_path(upload_id, part_number);
 
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to read part from S3: {}", e)))?;
+        let data = fs::read(&part_path).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to read part {} for upload {}: {}",
+                part_number, upload_id, e
+            ))
+        })?;
 
-        let data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to read S3 body: {}", e)))?;
-
-        Ok(data.into_bytes())
+        Ok(Bytes::from(data))
     }
 
     async fn assemble_parts(
@@ -101,118 +156,95 @@ impl StorageBackend for S3Storage {
         upload_id: &str,
         filename: &str,
         total_parts: i32,
+        target_path: Option<&str>,
     ) -> Result<String> {
-        let final_key = self.get_final_key(upload_id, filename);
-
-        // For S3, we need to use multipart upload to combine parts
-        // First, initiate a multipart upload
-        let create_response = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&final_key)
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to initiate multipart upload: {}", e)))?;
-
-        let multipart_upload_id = create_response
-            .upload_id()
-            .ok_or_else(|| AppError::Storage("No upload ID returned from S3".to_string()))?;
-
-        let mut completed_parts = Vec::new();
-
-        // Copy each part to the multipart upload
-        for part_num in 0..total_parts {
-            let source_key = self.get_part_key(upload_id, part_num);
-            let copy_source = format!("{}/{}", self.bucket, source_key);
-
-            let upload_response = self
-                .client
-                .upload_part_copy()
-                .bucket(&self.bucket)
-                .key(&final_key)
-                .upload_id(multipart_upload_id)
-                .part_number((part_num + 1) as i32) // S3 part numbers are 1-indexed
-                .copy_source(&copy_source)
-                .send()
-                .await
-                .map_err(|e| {
-                    AppError::Storage(format!("Failed to copy part {} to multipart: {}", part_num, e))
-                })?;
-
-            if let Some(copy_result) = upload_response.copy_part_result() {
-                if let Some(etag) = copy_result.e_tag() {
-                    completed_parts.push(
-                        aws_sdk_s3::types::CompletedPart::builder()
-                            .e_tag(etag)
-                            .part_number((part_num + 1) as i32)
-                            .build(),
-                    );
-                }
-            }
-
-            tracing::debug!("Copied part {} to multipart upload", part_num);
-        }
-
-        // Complete the multipart upload
-        let completed_upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
-            .set_parts(Some(completed_parts))
-            .build();
-
-        self.client
-            .complete_multipart_upload()
-            .bucket(&self.bucket)
-            .key(&final_key)
-            .upload_id(multipart_upload_id)
-            .multipart_upload(completed_upload)
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to complete multipart upload: {}", e)))?;
-
-        // Clean up source parts
-        self.delete_parts(upload_id).await?;
+        let final_key = self.get_final_key(upload_id, filename, target_path);
 
         tracing::info!(
-            "Assembled {} parts into s3://{}/{} for upload {}",
+            "Assembling {} parts for upload {} to S3: {}",
             total_parts,
-            self.bucket,
+            upload_id,
+            final_key
+        );
+
+        // Step 1: Assemble parts locally first
+        let temp_assembled = self.parts_path.join(format!("{}_assembled.tmp", upload_id));
+
+        let mut temp_file = fs::File::create(&temp_assembled).await.map_err(|e| {
+            AppError::Storage(format!("Failed to create temp assembled file: {}", e))
+        })?;
+
+        for part_num in 0..total_parts {
+            let part_path = self.get_part_path(upload_id, part_num);
+
+            let part_data = fs::read(&part_path).await.map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to read part {} during assembly: {}",
+                    part_num, e
+                ))
+            })?;
+
+            temp_file.write_all(&part_data).await.map_err(|e| {
+                AppError::Storage(format!("Failed to write to temp assembled file: {}", e))
+            })?;
+
+            tracing::debug!("Assembled part {} ({} bytes)", part_num, part_data.len());
+        }
+
+        temp_file.flush().await.map_err(|e| {
+            AppError::Storage(format!("Failed to flush temp assembled file: {}", e))
+        })?;
+        drop(temp_file);
+
+        // Step 2: Upload assembled file to S3 as a single object
+        let file_size = std::fs::metadata(&temp_assembled)
+            .map_err(|e| AppError::Storage(format!("Failed to get file size: {}", e)))?
+            .len();
+
+        tracing::info!(
+            "Uploading assembled file to S3: {} ({} bytes)",
             final_key,
+            file_size
+        );
+
+        let body = ByteStream::from_path(&temp_assembled)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to read assembled file: {}", e)))?;
+
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&final_key)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to upload to S3: {}", e)))?;
+
+        // Step 3: Clean up local temp files
+        fs::remove_file(&temp_assembled).await.ok();
+        self.delete_parts(upload_id).await?;
+
+        let final_path = format!("s3://{}/{}", self.bucket, final_key);
+        tracing::info!(
+            "Assembled {} parts into {} for upload {}",
+            total_parts,
+            final_path,
             upload_id
         );
 
-        Ok(format!("s3://{}/{}", self.bucket, final_key))
+        Ok(final_path)
     }
 
     async fn delete_parts(&self, upload_id: &str) -> Result<()> {
-        // List all parts for this upload
-        let prefix = format!(".parts/{}/", upload_id);
+        let parts_dir = self.get_upload_parts_dir(upload_id);
 
-        let list_response = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&prefix)
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to list parts: {}", e)))?;
-
-        if let Some(contents) = list_response.contents() {
-            for object in contents {
-                if let Some(key) = object.key() {
-                    self.client
-                        .delete_object()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            AppError::Storage(format!("Failed to delete part {}: {}", key, e))
-                        })?;
-                }
-            }
+        if parts_dir.exists() {
+            fs::remove_dir_all(&parts_dir).await.map_err(|e| {
+                AppError::Storage(format!("Failed to delete parts directory: {}", e))
+            })?;
+            tracing::debug!("Deleted local parts directory for upload {}", upload_id);
         }
 
-        tracing::debug!("Deleted all parts for upload {} from S3", upload_id);
         Ok(())
     }
 

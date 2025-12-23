@@ -13,9 +13,9 @@ impl Database {
             r#"
             INSERT INTO uploads (
                 id, filename, total_size, chunk_size, total_parts,
-                status, storage_backend, final_path, checksum_sha256,
+                status, storage_backend, target_path, final_path, checksum_sha256,
                 webhook_url, created_at, updated_at, expires_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             "#,
             params![
                 upload.id,
@@ -25,6 +25,7 @@ impl Database {
                 upload.total_parts,
                 upload.status.to_string(),
                 upload.storage_backend,
+                upload.target_path,
                 upload.final_path,
                 upload.checksum_sha256,
                 upload.webhook_url,
@@ -41,7 +42,7 @@ impl Database {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, filename, total_size, chunk_size, total_parts,
-                   status, storage_backend, final_path, checksum_sha256,
+                   status, storage_backend, target_path, final_path, checksum_sha256,
                    webhook_url, created_at, updated_at, expires_at
             FROM uploads WHERE id = ?1
             "#,
@@ -56,12 +57,13 @@ impl Database {
                 total_parts: row.get(4)?,
                 status: row.get::<_, String>(5)?.into(),
                 storage_backend: row.get(6)?,
-                final_path: row.get(7)?,
-                checksum_sha256: row.get(8)?,
-                webhook_url: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
-                expires_at: row.get(12)?,
+                target_path: row.get(7)?,
+                final_path: row.get(8)?,
+                checksum_sha256: row.get(9)?,
+                webhook_url: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+                expires_at: row.get(13)?,
             })
         }).map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => {
