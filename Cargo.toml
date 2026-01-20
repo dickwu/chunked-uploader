@@ -61,10 +61,10 @@ async-trait = "0.1"
 bytes = "1"
 
 # HTTP client for webhooks
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", features = ["json"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 hex = "0.4"
 
 [profile.release]

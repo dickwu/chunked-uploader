@@ -7,14 +7,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use smb::{
     Client, ClientConfig, CreateDisposition, CreateOptions, Dialect, FileAccessMask, FileAttributes,
-    FileCreateArgs, Resource, UncPath, WriteAt,
+    FileCreateArgs, FileDispositionInformation, Resource, UncPath, WriteAt,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use super::StorageBackend;
@@ -55,12 +55,8 @@ impl SmbStorage {
             format!(r"\\{}:{}\{}", config.smb_host, config.smb_port, config.smb_share)
         };
 
-        // Build base path within share
-        let base_path = if config.smb_path.is_empty() {
-            "files".to_string()
-        } else {
-            format!("{}/files", config.smb_path.trim_matches('/'))
-        };
+        // Base path within share (optional prefix)
+        let base_path = config.smb_path.trim_matches('/').to_string();
 
         let smb_config = SmbConfig {
             unc_path,
@@ -213,10 +209,24 @@ impl SmbStorage {
         Ok(())
     }
 
-    async fn ensure_smb_dir(client: &Client, config: &SmbConfig) -> Result<()> {
+    async fn ensure_smb_dirs_for_path(
+        client: &Client,
+        config: &SmbConfig,
+        smb_path: &str,
+    ) -> Result<()> {
+        let normalized_path = smb_path.replace('\\', "/");
+        let dir_path = match normalized_path.rsplit_once('/') {
+            Some((dir, _)) => dir,
+            None => "",
+        };
+
+        if dir_path.is_empty() {
+            return Ok(());
+        }
+
         // Create directory recursively
         // with_path() takes the full path at once, so we build cumulative paths
-        let parts: Vec<&str> = config.base_path.split('/').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = dir_path.split('/').filter(|s| !s.is_empty()).collect();
         let unc_path = UncPath::from_str(&config.unc_path)
             .map_err(|e| AppError::Storage(format!("Invalid UNC path: {}", e)))?;
 
@@ -229,7 +239,7 @@ impl SmbStorage {
             } else {
                 cumulative_path = format!("{}/{}", cumulative_path, part);
             }
-            
+
             // with_path takes the full path string
             let current_path = unc_path.clone().with_path(&cumulative_path);
 
@@ -297,9 +307,19 @@ impl SmbStorage {
         let unc_path = UncPath::from_str(&config.unc_path)
             .map_err(|e| AppError::Storage(format!("Invalid UNC path: {}", e)))?;
 
+        let base_path = config.base_path.trim_matches('/');
+        let default_dir = if base_path.is_empty() {
+            "files".to_string()
+        } else {
+            format!("{}/files", base_path)
+        };
+
         // with_path takes the full path at once
-        let test_file_path = format!("{}/.write_test", config.base_path);
+        let test_file_path = format!("{}/.write_test", default_dir);
         let test_path = unc_path.clone().with_path(&test_file_path);
+
+        // Ensure default directory exists for write test
+        Self::ensure_smb_dirs_for_path(client, config, &test_file_path).await?;
 
         // Create test file - overwrite if exists
         let mut create_args = FileCreateArgs::make_overwrite(
@@ -327,12 +347,8 @@ impl SmbStorage {
         }
 
         // Clean up - delete test file
-        let delete_args = FileCreateArgs::make_open_existing(
-            FileAccessMask::new().with_delete(true),
-        );
-
-        if let Ok(Resource::File(file)) = client.create_file(&test_path, &delete_args).await {
-            file.close().await.ok();
+        if let Err(e) = Self::delete_smb_resource(client, &test_path).await {
+            tracing::warn!("Failed to clean up SMB write test file: {}", e);
         }
 
         tracing::debug!("SMB write test passed");
@@ -349,7 +365,58 @@ impl SmbStorage {
         self.parts_path.join(upload_id)
     }
 
-    fn get_smb_file_path(&self, upload_id: &str, filename: &str, target_path: Option<&str>) -> String {
+    fn sanitize_target_path(path: &str) -> String {
+        path.trim_matches('/')
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_')
+            .collect()
+    }
+
+    fn get_smb_file_path(
+        &self,
+        upload_id: &str,
+        filename: &str,
+        target_path: Option<&str>,
+    ) -> String {
+        let safe_filename = Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unnamed");
+
+        let final_filename = format!("{}_{}", upload_id, safe_filename);
+        let base_path = self.smb_config.base_path.trim_matches('/');
+
+        // Use custom path if provided; otherwise default to "files/"
+        match target_path {
+            Some(path) => {
+                let clean_path = Self::sanitize_target_path(path);
+                if clean_path.is_empty() {
+                    if base_path.is_empty() {
+                        final_filename
+                    } else {
+                        format!("{}/{}", base_path, final_filename)
+                    }
+                } else if base_path.is_empty() {
+                    format!("{}/{}", clean_path, final_filename)
+                } else {
+                    format!("{}/{}/{}", base_path, clean_path, final_filename)
+                }
+            }
+            None => {
+                if base_path.is_empty() {
+                    format!("files/{}", final_filename)
+                } else {
+                    format!("{}/files/{}", base_path, final_filename)
+                }
+            }
+        }
+    }
+
+    fn get_smb_response_path(
+        upload_id: &str,
+        filename: &str,
+        target_path: Option<&str>,
+    ) -> String {
         let safe_filename = Path::new(filename)
             .file_name()
             .and_then(|n| n.to_str())
@@ -357,22 +424,16 @@ impl SmbStorage {
 
         let final_filename = format!("{}_{}", upload_id, safe_filename);
 
-        // Use custom path if provided, otherwise use base_path
         match target_path {
             Some(path) => {
-                let clean_path: String = path
-                    .trim_matches('/')
-                    .chars()
-                    .filter(|c| c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_')
-                    .collect();
-                
+                let clean_path = Self::sanitize_target_path(path);
                 if clean_path.is_empty() {
-                    format!("{}/{}", self.smb_config.base_path, final_filename)
+                    final_filename
                 } else {
-                    format!("{}/{}/{}", self.smb_config.base_path, clean_path, final_filename)
+                    format!("{}/{}", clean_path, final_filename)
                 }
             }
-            None => format!("{}/{}", self.smb_config.base_path, final_filename),
+            None => format!("files/{}", final_filename),
         }
     }
 
@@ -381,6 +442,94 @@ impl SmbStorage {
     fn build_smb_path(unc_path: &UncPath, path_str: &str) -> UncPath {
         // with_path expects the full path in one call
         unc_path.clone().with_path(path_str)
+    }
+
+    fn normalize_relative_path(config: &SmbConfig, path: &str) -> String {
+        let clean = path.trim_matches(|c| c == '\\' || c == '/');
+        let base = config.base_path.trim_matches('/');
+
+        if clean.is_empty() {
+            return base.to_string();
+        }
+
+        if base.is_empty() {
+            return clean.to_string();
+        }
+
+        let base_prefix = format!("{}/", base);
+        if clean == base || clean.starts_with(&base_prefix) {
+            return clean.to_string();
+        }
+
+        if base.ends_with("files") {
+            if clean == "files" {
+                return base.to_string();
+            }
+            if let Some(suffix) = clean.strip_prefix("files/") {
+                if suffix.is_empty() {
+                    return base.to_string();
+                }
+                return format!("{}/{}", base, suffix);
+            }
+        }
+
+        format!("{}/{}", base, clean)
+    }
+
+    fn build_unc_path_from_relative(config: &SmbConfig, path: &str) -> Result<UncPath> {
+        let base_unc = UncPath::from_str(&config.unc_path).map_err(|e| {
+            AppError::Storage(format!("Invalid UNC path {}: {}", config.unc_path, e))
+        })?;
+        let normalized = Self::normalize_relative_path(config, path);
+        Ok(base_unc.with_path(&normalized))
+    }
+
+    async fn delete_smb_resource(client: &Client, unc_path: &UncPath) -> Result<()> {
+        let delete_args = FileCreateArgs::make_open_existing(
+            FileAccessMask::new()
+                .with_generic_read(true)
+                .with_delete(true),
+        );
+
+        let resource = match client.create_file(unc_path, &delete_args).await {
+            Ok(resource) => resource,
+            Err(e) => {
+                let err_str = e.to_string().to_lowercase();
+                if err_str.contains("not found") || err_str.contains("does not exist") {
+                    return Ok(());
+                }
+                return Err(AppError::Storage(format!(
+                    "Failed to open SMB path for delete: {}",
+                    e
+                )));
+            }
+        };
+
+        match resource {
+            Resource::File(file) => {
+                file.set_info(FileDispositionInformation {
+                    delete_pending: true.into(),
+                })
+                .await
+                .map_err(|e| AppError::Storage(format!("Failed to delete SMB file: {}", e)))?;
+                file.close().await.ok();
+            }
+            Resource::Directory(dir) => {
+                dir.set_info(FileDispositionInformation {
+                    delete_pending: true.into(),
+                })
+                .await
+                .map_err(|e| AppError::Storage(format!("Failed to delete SMB directory: {}", e)))?;
+                dir.close().await.ok();
+            }
+            _ => {
+                return Err(AppError::Storage(
+                    "Unexpected SMB resource type for delete".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -496,7 +645,8 @@ impl StorageBackend for SmbStorage {
         let smb_path = Self::build_smb_path(&unc_path, &smb_path_str);
 
         // Get file size for progress tracking
-        let file_size = std::fs::metadata(&temp_path)
+        let file_size = fs::metadata(&temp_path)
+            .await
             .map_err(|e| AppError::Storage(format!("Failed to get file size: {}", e)))?
             .len();
 
@@ -518,7 +668,9 @@ impl StorageBackend for SmbStorage {
             };
 
             // Ensure target directory exists on SMB share
-            if let Err(e) = Self::ensure_smb_dir(&client, &self.smb_config).await {
+            if let Err(e) =
+                Self::ensure_smb_dirs_for_path(&client, &self.smb_config, &smb_path_str).await
+            {
                 tracing::warn!("Failed to ensure SMB directory: {}", e);
                 last_error = Some(e);
                 continue;
@@ -535,10 +687,11 @@ impl StorageBackend for SmbStorage {
                 Ok(Resource::File(file)) => {
                     // Use chunked writes for better performance with large files
                     const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
-                    let mut local_file = match std::fs::File::open(&temp_path) {
+                    let mut local_file = match fs::File::open(&temp_path).await {
                         Ok(f) => f,
                         Err(e) => {
-                            last_error = Some(AppError::Storage(format!("Failed to open temp file: {}", e)));
+                            last_error =
+                                Some(AppError::Storage(format!("Failed to open temp file: {}", e)));
                             continue;
                         }
                     };
@@ -549,43 +702,73 @@ impl StorageBackend for SmbStorage {
                     let start_time = std::time::Instant::now();
 
                     loop {
-                        use std::io::Read;
-                        let bytes_read = match local_file.read(&mut buffer) {
+                        let bytes_read = match local_file.read(&mut buffer).await {
                             Ok(0) => break, // EOF
                             Ok(n) => n,
                             Err(e) => {
-                                last_error = Some(AppError::Storage(format!("Failed to read temp file: {}", e)));
+                                last_error =
+                                    Some(AppError::Storage(format!("Failed to read temp file: {}", e)));
                                 write_success = false;
                                 break;
                             }
                         };
 
-                        match file.write_at(&buffer[..bytes_read], offset).await {
-                            Ok(written) => {
-                                offset += written as u64;
-                                // Log progress every 10MB
-                                if offset % (10 * 1024 * 1024) == 0 || offset == file_size {
-                                    let elapsed = start_time.elapsed().as_secs_f64();
-                                    let speed = if elapsed > 0.0 {
-                                        (offset as f64 / 1024.0 / 1024.0) / elapsed
-                                    } else {
-                                        0.0
-                                    };
-                                    tracing::debug!(
-                                        "SMB write progress: {:.1}MB / {:.1}MB ({:.1} MB/s)",
-                                        offset as f64 / 1024.0 / 1024.0,
-                                        file_size as f64 / 1024.0 / 1024.0,
-                                        speed
+                        let mut chunk_written = 0usize;
+                        while chunk_written < bytes_read {
+                            let write_offset = offset + chunk_written as u64;
+                            match file
+                                .write_at(&buffer[chunk_written..bytes_read], write_offset)
+                                .await
+                            {
+                                Ok(0) => {
+                                    last_error = Some(AppError::Storage(
+                                        "SMB write returned 0 bytes".to_string(),
+                                    ));
+                                    write_success = false;
+                                    break;
+                                }
+                                Ok(written) => {
+                                    chunk_written += written;
+                                    let total_written = offset + chunk_written as u64;
+                                    // Log progress every 10MB
+                                    if total_written % (10 * 1024 * 1024) == 0
+                                        || total_written == file_size
+                                    {
+                                        let elapsed = start_time.elapsed().as_secs_f64();
+                                        let speed = if elapsed > 0.0 {
+                                            (total_written as f64 / 1024.0 / 1024.0) / elapsed
+                                        } else {
+                                            0.0
+                                        };
+                                        tracing::debug!(
+                                            "SMB write progress: {:.1}MB / {:.1}MB ({:.1} MB/s)",
+                                            total_written as f64 / 1024.0 / 1024.0,
+                                            file_size as f64 / 1024.0 / 1024.0,
+                                            speed
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "SMB write failed at offset {}: {}",
+                                        write_offset,
+                                        e
                                     );
+                                    last_error = Some(AppError::Storage(format!(
+                                        "Failed to write to SMB: {}",
+                                        e
+                                    )));
+                                    write_success = false;
+                                    break;
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!("SMB write failed at offset {}: {}", offset, e);
-                                last_error = Some(AppError::Storage(format!("Failed to write to SMB: {}", e)));
-                                write_success = false;
-                                break;
-                            }
                         }
+
+                        if !write_success {
+                            break;
+                        }
+
+                        offset += bytes_read as u64;
                     }
 
                     if write_success {
@@ -613,17 +796,8 @@ impl StorageBackend for SmbStorage {
                         let full_path = format!("{}/{}", self.smb_config.unc_path, smb_file_path);
                         tracing::info!("Assembled {} parts to SMB: {}", total_parts, full_path);
                         
-                        // Extract just the files/... portion for the response
-                        let relative_path = if smb_file_path.contains("/files/") {
-                            // Path like "Sermons/files/uuid_filename" -> "files/uuid_filename"
-                            format!("files/{}", smb_file_path.rsplit("/files/").next().unwrap_or(&smb_file_path))
-                        } else if smb_file_path.starts_with("files/") {
-                            // Path already is "files/uuid_filename"
-                            smb_file_path.clone()
-                        } else {
-                            // Fallback to full relative path
-                            smb_file_path.clone()
-                        };
+                        let relative_path =
+                            Self::get_smb_response_path(upload_id, filename, target_path);
                         return Ok(relative_path);
                     }
                     // Write failed, don't return client
@@ -657,28 +831,22 @@ impl StorageBackend for SmbStorage {
     }
 
     async fn delete_file(&self, path: &str) -> Result<()> {
-        // Extract SMB path from full path
-        // Path format: \\server\share\path\to\file
-        let unc_path = UncPath::from_str(path)
-            .map_err(|e| AppError::Storage(format!("Invalid SMB path {}: {}", path, e)))?;
+        let unc_path = match UncPath::from_str(path) {
+            Ok(unc_path) => unc_path,
+            Err(_) => Self::build_unc_path_from_relative(&self.smb_config, path)?,
+        };
 
         // Try to get or reconnect client
         let client = self.get_or_reconnect_client().await?;
-
-        // Open file with delete access
-        let delete_args = FileCreateArgs::make_open_existing(
-            FileAccessMask::new().with_delete(true),
-        );
-
-        if let Ok(Resource::File(file)) = client.create_file(&unc_path, &delete_args).await {
-            file.close().await.ok();
-            tracing::debug!("Deleted SMB file: {}", path);
-        }
+        let result = Self::delete_smb_resource(&client, &unc_path).await;
 
         // Return client to pool
         self.return_client(Some(client)).await;
 
-        Ok(())
+        if result.is_ok() {
+            tracing::debug!("Deleted SMB path: {}", path);
+        }
+        result
     }
 
     fn backend_type(&self) -> &'static str {
