@@ -61,6 +61,37 @@ pub async fn complete_upload(
     }
 
     if upload.status == UploadStatus::Finalizing {
+        // Re-trigger if finalization has been stale for >5 minutes (dead task from restart/crash)
+        const STALE_THRESHOLD_SECS: i64 = 300;
+        if let Ok(true) = state.db.restart_stale_finalization(&upload_id, STALE_THRESHOLD_SECS) {
+            tracing::warn!(
+                "Re-triggering stale finalization for upload {} (no progress for >{}s)",
+                upload_id,
+                STALE_THRESHOLD_SECS
+            );
+
+            let state_clone = state.clone();
+            let upload_id_clone = upload_id.clone();
+            tokio::spawn(async move {
+                run_finalization_task(state_clone, upload_id_clone).await;
+            });
+
+            let current = state.db.get_upload(&upload_id)?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(CompleteUploadResponse {
+                    file_id: current.id,
+                    filename: current.filename,
+                    total_size: current.total_size,
+                    status: "finalizing".to_string(),
+                    phase: "finalizing".to_string(),
+                    final_path: current.final_path,
+                    storage_backend: current.storage_backend,
+                    finalizing_progress_percent: current.finalizing_progress_percent,
+                }),
+            ));
+        }
+
         return Ok((
             StatusCode::ACCEPTED,
             Json(CompleteUploadResponse {
@@ -126,7 +157,7 @@ pub async fn complete_upload(
     Ok((status_code, Json(response)))
 }
 
-async fn run_finalization_task(state: AppState, upload_id: String) {
+pub async fn run_finalization_task(state: AppState, upload_id: String) {
     let _permit = match state.finalization_semaphore.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => {

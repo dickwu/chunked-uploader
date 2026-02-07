@@ -55,15 +55,6 @@ async fn main() -> anyhow::Result<()> {
     db.run_migrations()?;
     let db = Arc::new(db);
 
-    // Mark any interrupted finalizations as failed after server restarts.
-    let recovered = db.mark_stale_finalizing_failed_on_boot()?;
-    if recovered > 0 {
-        tracing::warn!(
-            "Recovered {} stale finalizing uploads and marked them failed",
-            recovered
-        );
-    }
-
     // Initialize storage backend
     let storage: Arc<dyn StorageBackend> = match config.storage_backend {
         config::StorageBackendType::Local => {
@@ -106,6 +97,28 @@ async fn main() -> anyhow::Result<()> {
             config.max_concurrent_finalizations.max(1),
         )),
     };
+
+    // Re-trigger any finalizations interrupted by server restart
+    match db.list_finalizing_uploads() {
+        Ok(stale_uploads) if !stale_uploads.is_empty() => {
+            tracing::warn!(
+                "Found {} interrupted finalizing uploads, re-triggering...",
+                stale_uploads.len()
+            );
+            for upload in stale_uploads {
+                let upload_id = upload.id.clone();
+                if let Ok(true) = db.restart_stale_finalization(&upload_id, 0) {
+                    let state_clone = state.clone();
+                    tokio::spawn(async move {
+                        handlers::complete::run_finalization_task(state_clone, upload_id).await;
+                    });
+                    tracing::info!("Re-triggered finalization for upload {}", upload.id);
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("Failed to query stale finalizations: {}", e),
+    }
 
     // Start cleanup service
     let cleanup_service = CleanupService::new(db.clone(), state.storage.clone(), config.clone());

@@ -113,6 +113,48 @@ impl Database {
             .map_err(|e| AppError::Internal(format!("Failed to get database connection: {}", e)))
     }
 
+    /// List uploads stuck in "finalizing" state (for restart recovery).
+    pub fn list_finalizing_uploads(&self) -> Result<Vec<Upload>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, filename, total_size, chunk_size, total_parts,
+                   status, storage_backend, target_path, final_path, checksum_sha256,
+                   webhook_url, finalization_started_at, finalization_updated_at,
+                   finalization_error, finalizing_progress_percent,
+                   created_at, updated_at, expires_at
+            FROM uploads
+            WHERE status = 'finalizing'
+            "#,
+        )?;
+        let uploads: Vec<Upload> = stmt
+            .query_map([], |row| {
+                Ok(Upload {
+                    id: row.get(0)?,
+                    filename: row.get(1)?,
+                    total_size: row.get(2)?,
+                    chunk_size: row.get(3)?,
+                    total_parts: row.get(4)?,
+                    status: row.get::<_, String>(5)?.into(),
+                    storage_backend: row.get(6)?,
+                    target_path: row.get(7)?,
+                    final_path: row.get(8)?,
+                    checksum_sha256: row.get(9)?,
+                    webhook_url: row.get(10)?,
+                    finalization_started_at: row.get(11)?,
+                    finalization_updated_at: row.get(12)?,
+                    finalization_error: row.get(13)?,
+                    finalizing_progress_percent: row.get(14)?,
+                    created_at: row.get(15)?,
+                    updated_at: row.get(16)?,
+                    expires_at: row.get(17)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(uploads)
+    }
+
     /// List expired pending uploads for cleanup.
     pub fn list_expired_pending_uploads(&self) -> Result<Vec<Upload>> {
         let conn = self.get_conn()?;

@@ -119,6 +119,29 @@ impl Database {
         Ok(affected > 0)
     }
 
+    /// Re-trigger finalization for a stuck upload.
+    /// Returns true if the upload was stale and has been reset for retry.
+    pub fn restart_stale_finalization(&self, id: &str, stale_threshold_secs: i64) -> Result<bool> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - stale_threshold_secs;
+        let affected = conn.execute(
+            r#"
+            UPDATE uploads
+            SET finalization_started_at = ?1,
+                finalization_updated_at = ?1,
+                finalization_error = NULL,
+                finalizing_progress_percent = 0,
+                updated_at = ?1
+            WHERE id = ?2
+              AND status = 'finalizing'
+              AND finalization_updated_at < ?3
+            "#,
+            params![now, id, cutoff],
+        )?;
+        Ok(affected > 0)
+    }
+
     pub fn update_finalizing_progress(&self, id: &str, progress_percent: i32) -> Result<()> {
         let conn = self.get_conn()?;
         let now = chrono::Utc::now().timestamp();

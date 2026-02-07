@@ -1,7 +1,8 @@
 //! SMB/NAS Storage Backend using smb-rs (pure Rust SMB client)
 //!
-//! Chunks are written directly to an SMB partial file during part uploads.
-//! Finalization verifies file size and atomically renames `.partial` to final path.
+//! Parts are stored to fast local disk during upload (keeps HTTP responses fast).
+//! Each part is also synced to SMB in the background as it arrives.
+//! Finalization checks if SMB file is complete → fast rename. Falls back to streaming if needed.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use super::StorageBackend;
@@ -25,12 +27,14 @@ use crate::db::schema::Upload;
 use crate::error::{AppError, Result};
 
 pub struct SmbStorage {
-    /// Local temp storage (kept for compatibility/cleanup of old uploads)
+    /// Local temp storage for parts (fast SSD)
     parts_path: PathBuf,
     /// SMB connection info
     smb_config: SmbConfig,
-    /// SMB client connection pool (single reusable client)
+    /// SMB client for finalization/management operations
     client: Arc<Mutex<Option<Client>>>,
+    /// Dedicated SMB client for background part syncs (separate connection)
+    sync_client: Arc<Mutex<Option<Client>>>,
     /// Per-upload write/finalize lock
     upload_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -86,8 +90,15 @@ impl SmbStorage {
             parts_path,
             smb_config,
             client: Arc::new(Mutex::new(None)),
+            sync_client: Arc::new(Mutex::new(None)),
             upload_locks: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    fn get_local_part_path(&self, upload_id: &str, part_number: i32) -> PathBuf {
+        self.parts_path
+            .join(upload_id)
+            .join(format!("part_{:06}", part_number))
     }
 
     async fn get_upload_lock(&self, upload_id: &str) -> Arc<Mutex<()>> {
@@ -496,10 +507,109 @@ impl SmbStorage {
             ))),
         }
     }
+
+    /// Get the size of an SMB file. Returns 0 if file doesn't exist.
+    async fn get_smb_file_size(&self, client: &Client, smb_path_str: &str) -> Result<u64> {
+        let unc_path = Self::build_unc_path_from_relative(&self.smb_config, smb_path_str)?;
+        let open_args = FileCreateArgs::make_open_existing(
+            FileAccessMask::new().with_generic_read(true),
+        );
+
+        match client.create_file(&unc_path, &open_args).await {
+            Ok(Resource::File(file)) => {
+                let info: FileStandardInformation = file
+                    .query_info()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("Failed to query SMB file info: {}", e)))?;
+                let size = info.end_of_file;
+                file.close().await.ok();
+                Ok(size)
+            }
+            Ok(_) => Ok(0),
+            Err(_) => Ok(0), // File doesn't exist yet
+        }
+    }
+}
+
+/// Fire-and-forget: sync one part to the SMB partial file at the correct offset.
+/// Uses its own dedicated client connection (separate from finalization client).
+async fn background_sync_part(
+    sync_client: Arc<Mutex<Option<Client>>>,
+    smb_config: &SmbConfig,
+    partial_path: &str,
+    offset: u64,
+    data: Bytes,
+) -> std::result::Result<(), String> {
+    // Get or reconnect the dedicated sync client
+    let client = {
+        let mut guard = sync_client.lock().await;
+        if guard.is_none() {
+            let new_client = SmbStorage::create_client(smb_config)
+                .await
+                .map_err(|e| format!("Sync client connect failed: {}", e))?;
+            *guard = Some(new_client);
+        }
+        guard.take().unwrap()
+    };
+
+    let write_result = async {
+        // Ensure dirs + open/create the partial file
+        SmbStorage::ensure_smb_dirs_for_path(&client, smb_config, partial_path)
+            .await
+            .map_err(|e| format!("ensure dirs: {}", e))?;
+
+        let unc_path = SmbStorage::build_unc_path_from_relative(smb_config, partial_path)
+            .map_err(|e| format!("build UNC: {}", e))?;
+
+        let create_args = FileCreateArgs {
+            disposition: CreateDisposition::OpenIf,
+            attributes: FileAttributes::default(),
+            options: CreateOptions::new().with_non_directory_file(true),
+            desired_access: FileAccessMask::new()
+                .with_generic_read(true)
+                .with_generic_write(true),
+        };
+
+        let file = match client.create_file(&unc_path, &create_args).await {
+            Ok(Resource::File(f)) => f,
+            Ok(_) => return Err("Expected file resource".to_string()),
+            Err(e) => return Err(format!("open partial file: {}", e)),
+        };
+
+        // Write at the correct offset
+        let mut written = 0usize;
+        while written < data.len() {
+            let bytes = file
+                .write_at(&data[written..], offset + written as u64)
+                .await
+                .map_err(|e| format!("write_at: {}", e))?;
+            if bytes == 0 {
+                return Err("write_at returned 0 bytes".to_string());
+            }
+            written += bytes;
+        }
+
+        file.close().await.ok();
+        Ok::<(), String>(())
+    }
+    .await;
+
+    // Return client to pool (even on error, try to keep the connection)
+    match &write_result {
+        Ok(()) => {
+            sync_client.lock().await.replace(client);
+        }
+        Err(_) => {
+            // Drop the client on error (force reconnect next time)
+        }
+    }
+
+    write_result
 }
 
 #[async_trait]
 impl StorageBackend for SmbStorage {
+    /// Store part to local disk (fast), then fire-and-forget background sync to SMB.
     async fn store_part(
         &self,
         upload: &Upload,
@@ -507,22 +617,144 @@ impl StorageBackend for SmbStorage {
         data: Bytes,
     ) -> Result<String> {
         let upload_id = &upload.id;
+        let part_path = self.get_local_part_path(upload_id, part_number);
+        let data_len = data.len();
+
+        // Phase 1: Write to local disk (fast — this is what the HTTP handler waits on)
+        if let Some(parent) = part_path.parent() {
+            fs::create_dir_all(parent).await.map_err(|e| {
+                AppError::Storage(format!("Failed to create upload directory: {}", e))
+            })?;
+        }
+
+        let mut file = fs::File::create(&part_path).await.map_err(|e| {
+            AppError::Storage(format!("Failed to create part file: {}", e))
+        })?;
+
+        file.write_all(&data).await.map_err(|e| {
+            AppError::Storage(format!("Failed to write part data: {}", e))
+        })?;
+
+        file.flush().await.map_err(|e| {
+            AppError::Storage(format!("Failed to flush part data: {}", e))
+        })?;
+
+        tracing::debug!(
+            "Stored part {} for upload {} locally ({} bytes)",
+            part_number, upload_id, data_len
+        );
+
+        // Phase 2: Fire-and-forget background sync to SMB
+        let partial_path = self.get_smb_partial_path(
+            upload_id,
+            &upload.filename,
+            upload.target_path.as_deref(),
+        );
+        let offset = (part_number as u64)
+            .checked_mul(upload.chunk_size as u64)
+            .unwrap_or(0);
+        let sync_client = self.sync_client.clone();
+        let smb_config = self.smb_config.clone();
+        let upload_id_owned = upload_id.to_string();
+
+        tokio::spawn(async move {
+            if let Err(e) = background_sync_part(
+                sync_client,
+                &smb_config,
+                &partial_path,
+                offset,
+                data,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Background SMB sync failed for upload {} part {} (will retry during finalization): {}",
+                    upload_id_owned, part_number, e
+                );
+            } else {
+                tracing::debug!(
+                    "Background SMB sync complete for upload {} part {} ({} bytes)",
+                    upload_id_owned, part_number, data_len
+                );
+            }
+        });
+
+        Ok(part_path.to_string_lossy().to_string())
+    }
+
+    async fn read_part(&self, upload_id: &str, part_number: i32) -> Result<Bytes> {
+        let part_path = self.get_local_part_path(upload_id, part_number);
+        let data = fs::read(&part_path).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to read part {} for upload {}: {}",
+                part_number, upload_id, e
+            ))
+        })?;
+        Ok(Bytes::from(data))
+    }
+
+    async fn assemble_parts(
+        &self,
+        upload_id: &str,
+        filename: &str,
+        total_parts: i32,
+        target_path: Option<&str>,
+    ) -> Result<String> {
+        // This is called by the default finalize_upload, but we override finalize_upload,
+        // so this is only here as a fallback.
+        let _ = (upload_id, filename, total_parts, target_path);
+        Err(AppError::Storage(
+            "SMB backend uses finalize_upload directly; assemble_parts not supported".to_string(),
+        ))
+    }
+
+    /// Verify all local parts exist and have correct total size.
+    async fn verify_upload_ready(&self, upload: &Upload) -> Result<()> {
+        let upload_id = &upload.id;
+        let mut total_bytes: u64 = 0;
+
+        for part_num in 0..upload.total_parts {
+            let part_path = self.get_local_part_path(upload_id, part_num);
+            let metadata = fs::metadata(&part_path).await.map_err(|e| {
+                AppError::Storage(format!(
+                    "Finalization verification failed: part {} missing for upload {}: {}",
+                    part_num, upload_id, e
+                ))
+            })?;
+            total_bytes += metadata.len();
+        }
+
+        let expected = upload.total_size as u64;
+        if total_bytes != expected {
+            return Err(AppError::Storage(format!(
+                "Finalization verification failed: total parts size mismatch for upload {} (expected {}, got {})",
+                upload_id, expected, total_bytes
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Finalize upload to SMB.
+    /// Fast path: background syncs already wrote everything → just verify size and rename.
+    /// Slow path: stream any missing data from local parts, then rename.
+    async fn finalize_upload(&self, upload: &Upload) -> Result<String> {
+        let upload_id = &upload.id;
         let lock = self.get_upload_lock(upload_id).await;
         let _guard = lock.lock().await;
 
         let partial_path =
             self.get_smb_partial_path(upload_id, &upload.filename, upload.target_path.as_deref());
-        let offset = (part_number as u64)
-            .checked_mul(upload.chunk_size as u64)
-            .ok_or_else(|| AppError::Storage("Part offset overflow".to_string()))?;
+        let final_path =
+            self.get_smb_file_path(upload_id, &upload.filename, upload.target_path.as_deref());
+        let expected_size = upload.total_size as u64;
 
         let mut last_error: Option<AppError> = None;
         for attempt in 0..3 {
             if attempt > 0 {
                 tracing::warn!(
-                    "Retrying SMB part write for upload {} part {} attempt {}/3",
+                    "Retrying SMB finalization for upload {} attempt {}/3",
                     upload_id,
-                    part_number,
                     attempt + 1
                 );
                 self.return_client(None).await;
@@ -532,49 +764,149 @@ impl StorageBackend for SmbStorage {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(AppError::Storage(format!(
-                        "SMB reconnect failed for part write: {}",
+                        "SMB reconnect failed during finalization: {}",
                         e
                     )));
                     continue;
                 }
             };
 
-            let write_result = async {
-                let file = self.open_or_create_for_write(&client, &partial_path).await?;
+            let stream_result = async {
+                // Check if background syncs already completed the file
+                let current_size = self
+                    .get_smb_file_size(&client, &partial_path)
+                    .await
+                    .unwrap_or(0);
 
-                let mut written = 0usize;
-                while written < data.len() {
-                    let bytes = file
-                        .write_at(&data[written..], offset + written as u64)
-                        .await
-                        .map_err(|e| AppError::Storage(format!("Failed to write SMB part: {}", e)))?;
+                if current_size >= expected_size {
+                    tracing::info!(
+                        "Fast path: background syncs completed for upload {} ({} bytes already on SMB)",
+                        upload_id,
+                        current_size
+                    );
+                } else {
+                    // Slow path: stream parts that haven't been synced yet
+                    let first_missing_offset = current_size;
+                    let chunk_size = upload.chunk_size as u64;
+                    let first_missing_part = if chunk_size > 0 {
+                        (first_missing_offset / chunk_size) as i32
+                    } else {
+                        0
+                    };
 
-                    if bytes == 0 {
-                        return Err(AppError::Storage(
-                            "SMB write returned 0 bytes".to_string(),
-                        ));
+                    tracing::info!(
+                        "Partial sync: {} of {} bytes on SMB for upload {}, streaming from part {}",
+                        current_size,
+                        expected_size,
+                        upload_id,
+                        first_missing_part
+                    );
+
+                    let file = self.open_or_create_for_write(&client, &partial_path).await?;
+
+                    let mut offset = first_missing_part as u64 * chunk_size;
+                    for part_num in first_missing_part..upload.total_parts {
+                        let part_path = self.get_local_part_path(upload_id, part_num);
+                        let part_data = fs::read(&part_path).await.map_err(|e| {
+                            AppError::Storage(format!(
+                                "Failed to read part {} during finalization: {}",
+                                part_num, e
+                            ))
+                        })?;
+
+                        let mut written = 0usize;
+                        while written < part_data.len() {
+                            let bytes = file
+                                .write_at(&part_data[written..], offset + written as u64)
+                                .await
+                                .map_err(|e| {
+                                    AppError::Storage(format!("Failed to write to SMB: {}", e))
+                                })?;
+
+                            if bytes == 0 {
+                                return Err(AppError::Storage(
+                                    "SMB write returned 0 bytes".to_string(),
+                                ));
+                            }
+                            written += bytes;
+                        }
+
+                        offset += part_data.len() as u64;
+                        tracing::debug!(
+                            "Streamed part {} ({} bytes) to SMB for upload {}",
+                            part_num,
+                            part_data.len(),
+                            upload_id
+                        );
                     }
-                    written += bytes;
-                }
 
-                if let Err(e) = file.close().await {
-                    tracing::warn!("Failed to close SMB file after part write: {}", e);
+                    if let Err(e) = file.close().await {
+                        tracing::warn!("Failed to close SMB partial file: {}", e);
+                    }
                 }
 
                 Ok::<(), AppError>(())
             }
             .await;
 
-            match write_result {
+            match stream_result {
                 Ok(()) => {
+                    // Rename partial → final
+                    let rename_result = async {
+                        Self::ensure_smb_dirs_for_path(&client, &self.smb_config, &final_path)
+                            .await?;
+
+                        let file =
+                            self.open_existing_file(&client, &partial_path, true).await?;
+                        file.set_info(FileRenameInformation {
+                            replace_if_exists: true.into(),
+                            root_directory: 0,
+                            file_name: SizedWideString::from(final_path.clone()),
+                        })
+                        .await
+                        .map_err(|e| {
+                            AppError::Storage(format!(
+                                "Failed to rename SMB partial file: {}",
+                                e
+                            ))
+                        })?;
+
+                        if let Err(e) = file.close().await {
+                            tracing::warn!("Failed to close SMB file after rename: {}", e);
+                        }
+
+                        Ok::<(), AppError>(())
+                    }
+                    .await;
+
                     self.return_client(Some(client)).await;
-                    tracing::debug!(
-                        "Stored part {} for upload {} directly to SMB partial file ({} bytes)",
-                        part_number,
+                    rename_result?;
+
+                    // Clean up local parts
+                    let local_parts_dir = self.parts_path.join(upload_id);
+                    if local_parts_dir.exists() {
+                        if let Err(e) = fs::remove_dir_all(&local_parts_dir).await {
+                            tracing::warn!(
+                                "Failed to clean up local parts for upload {}: {}",
+                                upload_id,
+                                e
+                            );
+                        }
+                    }
+
+                    self.remove_upload_lock(upload_id).await;
+
+                    let response_path = Self::get_smb_response_path(
                         upload_id,
-                        data.len()
+                        &upload.filename,
+                        upload.target_path.as_deref(),
                     );
-                    return Ok(partial_path);
+                    tracing::info!(
+                        "Finalized upload {} to SMB path {}",
+                        upload_id,
+                        final_path
+                    );
+                    return Ok(response_path);
                 }
                 Err(e) => {
                     last_error = Some(e);
@@ -583,137 +915,36 @@ impl StorageBackend for SmbStorage {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            AppError::Storage("SMB part write failed after retries".to_string())
+            AppError::Storage("SMB finalization failed after retries".to_string())
         }))
     }
 
-    async fn read_part(&self, upload_id: &str, part_number: i32) -> Result<Bytes> {
-        let part_path = self
-            .parts_path
-            .join(upload_id)
-            .join(format!("part_{:06}", part_number));
-        let data = fs::read(&part_path).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to read local compatibility part {} for upload {}: {}",
-                part_number, upload_id, e
-            ))
-        })?;
-        Ok(Bytes::from(data))
-    }
-
-    async fn assemble_parts(
-        &self,
-        _upload_id: &str,
-        _filename: &str,
-        _total_parts: i32,
-        _target_path: Option<&str>,
-    ) -> Result<String> {
-        Err(AppError::Storage(
-            "SMB direct mode does not use assemble_parts; call finalize_upload instead".to_string(),
-        ))
-    }
-
-    async fn verify_upload_ready(&self, upload: &Upload) -> Result<()> {
-        let upload_id = &upload.id;
-        let lock = self.get_upload_lock(upload_id).await;
-        let _guard = lock.lock().await;
-
-        let partial_path =
-            self.get_smb_partial_path(upload_id, &upload.filename, upload.target_path.as_deref());
-
-        let client = self.get_or_reconnect_client().await?;
-        let verify_result = async {
-            let file = self.open_existing_file(&client, &partial_path, false).await?;
-            let info = file
-                .query_info::<FileStandardInformation>()
-                .await
-                .map_err(|e| AppError::Storage(format!("Failed to query SMB file info: {}", e)))?;
-
-            if let Err(e) = file.close().await {
-                tracing::warn!("Failed to close SMB file after verify: {}", e);
-            }
-
-            let expected = upload.total_size as u64;
-            if info.end_of_file != expected {
-                return Err(AppError::Storage(format!(
-                    "Finalization verification failed: partial file size mismatch for upload {} (expected {}, got {})",
-                    upload_id, expected, info.end_of_file
-                )));
-            }
-
-            Ok::<(), AppError>(())
-        }
-        .await;
-
-        self.return_client(Some(client)).await;
-        verify_result
-    }
-
-    async fn finalize_upload(&self, upload: &Upload) -> Result<String> {
-        let upload_id = &upload.id;
-        let lock = self.get_upload_lock(upload_id).await;
-        let _guard = lock.lock().await;
-
-        let partial_path =
-            self.get_smb_partial_path(upload_id, &upload.filename, upload.target_path.as_deref());
-        let final_path = self.get_smb_file_path(upload_id, &upload.filename, upload.target_path.as_deref());
-
-        let client = self.get_or_reconnect_client().await?;
-        let finalize_result = async {
-            // Ensure destination directory exists even when no part write happened in this process.
-            Self::ensure_smb_dirs_for_path(&client, &self.smb_config, &final_path).await?;
-
-            let file = self.open_existing_file(&client, &partial_path, true).await?;
-            file.set_info(FileRenameInformation {
-                replace_if_exists: true.into(),
-                root_directory: 0,
-                file_name: SizedWideString::from(final_path.clone()),
-            })
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to rename SMB partial file: {}", e)))?;
-
-            if let Err(e) = file.close().await {
-                tracing::warn!("Failed to close SMB file after rename: {}", e);
-            }
-
-            Ok::<(), AppError>(())
-        }
-        .await;
-
-        self.return_client(Some(client)).await;
-        finalize_result?;
-
-        self.remove_upload_lock(upload_id).await;
-
-        let response_path =
-            Self::get_smb_response_path(upload_id, &upload.filename, upload.target_path.as_deref());
-        tracing::info!("Finalized upload {} to SMB path {}", upload_id, final_path);
-        Ok(response_path)
-    }
-
     async fn cleanup_incomplete_upload(&self, upload: &Upload) -> Result<()> {
+        // Clean up any SMB partial file (may exist from previous or current attempt)
         let partial_path =
             self.get_smb_partial_path(&upload.id, &upload.filename, upload.target_path.as_deref());
 
-        let client = self.get_or_reconnect_client().await?;
-        let unc_path = Self::build_unc_path_from_relative(&self.smb_config, &partial_path)?;
-        let delete_result = Self::delete_smb_resource(&client, &unc_path).await;
-        self.return_client(Some(client)).await;
-
-        if let Err(e) = delete_result {
-            tracing::warn!(
-                "Failed to delete SMB partial file for upload {}: {}",
-                upload.id,
-                e
-            );
+        if let Ok(client) = self.get_or_reconnect_client().await {
+            if let Ok(unc_path) =
+                Self::build_unc_path_from_relative(&self.smb_config, &partial_path)
+            {
+                if let Err(e) = Self::delete_smb_resource(&client, &unc_path).await {
+                    tracing::warn!(
+                        "Failed to delete SMB partial file for upload {}: {}",
+                        upload.id,
+                        e
+                    );
+                }
+            }
+            self.return_client(Some(client)).await;
         }
 
-        // Backward compatibility cleanup for any local parts created by previous versions.
+        // Clean up local parts
         let local_parts = self.parts_path.join(&upload.id);
         if local_parts.exists() {
             if let Err(e) = fs::remove_dir_all(&local_parts).await {
                 tracing::warn!(
-                    "Failed to remove local compatibility parts for upload {}: {}",
+                    "Failed to remove local parts for upload {}: {}",
                     upload.id,
                     e
                 );
