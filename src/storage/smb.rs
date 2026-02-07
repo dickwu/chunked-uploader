@@ -20,11 +20,18 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 
 use super::StorageBackend;
 use crate::config::Config;
 use crate::db::schema::Upload;
 use crate::error::{AppError, Result};
+
+/// Max bytes per SMB write_at call. The smb crate does NOT split large writes internally —
+/// it sends the entire buffer as one SMB write request. SMB servers typically negotiate
+/// MaxWriteSize of 1-4MB. Sending 50MB causes the TCP send to block forever.
+/// 1MB is safe for all SMB3 servers.
+const SMB_WRITE_CHUNK: usize = 1024 * 1024; // 1MB
 
 pub struct SmbStorage {
     /// Local temp storage for parts (fast SSD)
@@ -533,7 +540,35 @@ impl SmbStorage {
 
 /// Fire-and-forget: sync one part to the SMB partial file at the correct offset.
 /// Uses its own dedicated client connection (separate from finalization client).
+/// Entire operation has a 120s timeout to prevent infinite hangs.
 async fn background_sync_part(
+    sync_client: Arc<Mutex<Option<Client>>>,
+    smb_config: &SmbConfig,
+    partial_path: &str,
+    offset: u64,
+    data: Bytes,
+) -> std::result::Result<(), String> {
+    const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
+
+    match timeout(SYNC_TIMEOUT, background_sync_part_inner(
+        sync_client.clone(),
+        smb_config,
+        partial_path,
+        offset,
+        data,
+    ))
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            // Timeout — drop the client (likely dead connection)
+            sync_client.lock().await.take();
+            Err(format!("Background sync timed out after {}s", SYNC_TIMEOUT.as_secs()))
+        }
+    }
+}
+
+async fn background_sync_part_inner(
     sync_client: Arc<Mutex<Option<Client>>>,
     smb_config: &SmbConfig,
     partial_path: &str,
@@ -576,11 +611,12 @@ async fn background_sync_part(
             Err(e) => return Err(format!("open partial file: {}", e)),
         };
 
-        // Write at the correct offset
+        // Write at the correct offset, chunked to SMB_WRITE_CHUNK (1MB)
         let mut written = 0usize;
         while written < data.len() {
+            let end = (written + SMB_WRITE_CHUNK).min(data.len());
             let bytes = file
-                .write_at(&data[written..], offset + written as u64)
+                .write_at(&data[written..end], offset + written as u64)
                 .await
                 .map_err(|e| format!("write_at: {}", e))?;
             if bytes == 0 {
@@ -738,7 +774,13 @@ impl StorageBackend for SmbStorage {
     /// Finalize upload to SMB.
     /// Fast path: background syncs already wrote everything → just verify size and rename.
     /// Slow path: stream any missing data from local parts, then rename.
+    /// Every SMB operation has a timeout to prevent infinite hangs.
     async fn finalize_upload(&self, upload: &Upload) -> Result<String> {
+        // Timeouts: 60s per part write, 30s for metadata ops, 10 min total per attempt
+        const PER_PART_TIMEOUT: Duration = Duration::from_secs(120);
+        const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
         let upload_id = &upload.id;
         let lock = self.get_upload_lock(upload_id).await;
         let _guard = lock.lock().await;
@@ -758,25 +800,38 @@ impl StorageBackend for SmbStorage {
                     attempt + 1
                 );
                 self.return_client(None).await;
+                // Back off before retry
+                tokio::time::sleep(Duration::from_secs(2u64.pow(attempt as u32))).await;
             }
 
-            let client = match self.get_or_reconnect_client().await {
-                Ok(c) => c,
-                Err(e) => {
+            let client = match timeout(CONNECT_TIMEOUT, self.get_or_reconnect_client()).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
                     last_error = Some(AppError::Storage(format!(
                         "SMB reconnect failed during finalization: {}",
                         e
                     )));
                     continue;
                 }
+                Err(_) => {
+                    last_error = Some(AppError::Storage(
+                        "SMB connection timed out (15s)".to_string(),
+                    ));
+                    continue;
+                }
             };
 
             let stream_result = async {
                 // Check if background syncs already completed the file
-                let current_size = self
-                    .get_smb_file_size(&client, &partial_path)
-                    .await
-                    .unwrap_or(0);
+                let current_size = match timeout(
+                    METADATA_TIMEOUT,
+                    self.get_smb_file_size(&client, &partial_path),
+                )
+                .await
+                {
+                    Ok(Ok(size)) => size,
+                    _ => 0, // Timeout or error → assume nothing synced
+                };
 
                 if current_size >= expected_size {
                     tracing::info!(
@@ -786,23 +841,31 @@ impl StorageBackend for SmbStorage {
                     );
                 } else {
                     // Slow path: stream parts that haven't been synced yet
-                    let first_missing_offset = current_size;
                     let chunk_size = upload.chunk_size as u64;
                     let first_missing_part = if chunk_size > 0 {
-                        (first_missing_offset / chunk_size) as i32
+                        (current_size / chunk_size) as i32
                     } else {
                         0
                     };
 
                     tracing::info!(
-                        "Partial sync: {} of {} bytes on SMB for upload {}, streaming from part {}",
+                        "Streaming to SMB: {} of {} bytes done for upload {}, resuming from part {}/{}",
                         current_size,
                         expected_size,
                         upload_id,
-                        first_missing_part
+                        first_missing_part,
+                        upload.total_parts
                     );
 
-                    let file = self.open_or_create_for_write(&client, &partial_path).await?;
+                    let file = timeout(
+                        METADATA_TIMEOUT,
+                        self.open_or_create_for_write(&client, &partial_path),
+                    )
+                    .await
+                    .map_err(|_| AppError::Storage("Timeout opening SMB partial file".to_string()))?
+                    .map_err(|e| {
+                        AppError::Storage(format!("Failed to open SMB partial file: {}", e))
+                    })?;
 
                     let mut offset = first_missing_part as u64 * chunk_size;
                     for part_num in first_missing_part..upload.total_parts {
@@ -814,28 +877,57 @@ impl StorageBackend for SmbStorage {
                             ))
                         })?;
 
-                        let mut written = 0usize;
-                        while written < part_data.len() {
-                            let bytes = file
-                                .write_at(&part_data[written..], offset + written as u64)
-                                .await
-                                .map_err(|e| {
-                                    AppError::Storage(format!("Failed to write to SMB: {}", e))
-                                })?;
+                        // Wrap the entire part write in a timeout.
+                        // CRITICAL: chunk each write_at to SMB_WRITE_CHUNK (1MB).
+                        // The smb crate sends the entire buffer as one SMB request —
+                        // 50MB requests hang forever on the TCP send.
+                        let part_len = part_data.len();
+                        let write_result = timeout(PER_PART_TIMEOUT, async {
+                            let mut written = 0usize;
+                            while written < part_data.len() {
+                                let end = (written + SMB_WRITE_CHUNK).min(part_data.len());
+                                let bytes = file
+                                    .write_at(
+                                        &part_data[written..end],
+                                        offset + written as u64,
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        AppError::Storage(format!(
+                                            "SMB write_at failed for part {}: {}",
+                                            part_num, e
+                                        ))
+                                    })?;
 
-                            if bytes == 0 {
-                                return Err(AppError::Storage(
-                                    "SMB write returned 0 bytes".to_string(),
-                                ));
+                                if bytes == 0 {
+                                    return Err(AppError::Storage(
+                                        "SMB write returned 0 bytes".to_string(),
+                                    ));
+                                }
+                                written += bytes;
                             }
-                            written += bytes;
+                            Ok::<(), AppError>(())
+                        })
+                        .await;
+
+                        match write_result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(e),
+                            Err(_) => {
+                                return Err(AppError::Storage(format!(
+                                    "SMB write timed out for part {} ({}s limit)",
+                                    part_num,
+                                    PER_PART_TIMEOUT.as_secs()
+                                )));
+                            }
                         }
 
-                        offset += part_data.len() as u64;
-                        tracing::debug!(
-                            "Streamed part {} ({} bytes) to SMB for upload {}",
-                            part_num,
-                            part_data.len(),
+                        offset += part_len as u64;
+                        tracing::info!(
+                            "Streamed part {}/{} ({} bytes) to SMB for upload {}",
+                            part_num + 1,
+                            upload.total_parts,
+                            part_len,
                             upload_id
                         );
                     }
@@ -851,8 +943,8 @@ impl StorageBackend for SmbStorage {
 
             match stream_result {
                 Ok(()) => {
-                    // Rename partial → final
-                    let rename_result = async {
+                    // Rename partial → final (with timeout)
+                    let rename_result = timeout(METADATA_TIMEOUT, async {
                         Self::ensure_smb_dirs_for_path(&client, &self.smb_config, &final_path)
                             .await?;
 
@@ -876,11 +968,20 @@ impl StorageBackend for SmbStorage {
                         }
 
                         Ok::<(), AppError>(())
-                    }
+                    })
                     .await;
 
                     self.return_client(Some(client)).await;
-                    rename_result?;
+
+                    match rename_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            return Err(AppError::Storage(
+                                "SMB rename timed out (30s)".to_string(),
+                            ));
+                        }
+                    }
 
                     // Clean up local parts
                     let local_parts_dir = self.parts_path.join(upload_id);
@@ -909,6 +1010,13 @@ impl StorageBackend for SmbStorage {
                     return Ok(response_path);
                 }
                 Err(e) => {
+                    tracing::error!(
+                        "SMB finalization attempt {} failed for upload {}: {}",
+                        attempt + 1,
+                        upload_id,
+                        e
+                    );
+                    self.return_client(None).await; // Drop broken client
                     last_error = Some(e);
                 }
             }

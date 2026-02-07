@@ -215,11 +215,27 @@ pub async fn run_finalization_task(state: AppState, upload_id: String) {
         return;
     }
 
-    if let Err(e) = state.db.update_finalizing_progress(&upload_id, 95) {
+    if let Err(e) = state.db.update_finalizing_progress(&upload_id, 10) {
         tracing::warn!("Failed to update finalizing progress for {}: {}", upload_id, e);
     }
 
-    let final_path = match state.storage.finalize_upload(&upload).await {
+    // Heartbeat: increment progress every 5s while finalize_upload runs.
+    // This shows the client the server is alive, not stuck.
+    let heartbeat_db = state.db.clone();
+    let heartbeat_id = upload_id.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut progress = 10;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            progress = (progress + 1).min(98); // Never reach 100
+            let _ = heartbeat_db.update_finalizing_progress(&heartbeat_id, progress);
+        }
+    });
+
+    let finalize_result = state.storage.finalize_upload(&upload).await;
+    heartbeat.abort(); // Kill heartbeat regardless of outcome
+
+    let final_path = match finalize_result {
         Ok(path) => path,
         Err(e) => {
             mark_finalization_failed(
