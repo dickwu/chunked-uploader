@@ -31,6 +31,12 @@ pub async fn cancel_upload(
 
     tracing::info!("Cancelling upload: id={}, status={}", upload_id, upload.status);
 
+    if upload.status == UploadStatus::Finalizing {
+        return Err(crate::error::AppError::Conflict(
+            "Upload is finalizing and cannot be cancelled".to_string(),
+        ));
+    }
+
     // Clean up storage
     if upload.status == UploadStatus::Complete {
         // Delete the final file if it exists
@@ -40,9 +46,9 @@ pub async fn cancel_upload(
             }
         }
     } else {
-        // Delete any uploaded parts
-        if let Err(e) = state.storage.delete_parts(&upload_id).await {
-            tracing::warn!("Failed to delete parts: {}", e);
+        // Delete any incomplete upload artifacts.
+        if let Err(e) = state.storage.cleanup_incomplete_upload(&upload).await {
+            tracing::warn!("Failed to cleanup incomplete upload: {}", e);
         }
     }
 
@@ -55,4 +61,3 @@ pub async fn cancel_upload(
         message: "Upload cancelled and cleaned up".to_string(),
     }))
 }
-

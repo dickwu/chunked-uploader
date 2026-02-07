@@ -11,7 +11,8 @@ A production-ready Rust HTTP server supporting **resumable chunked uploads** for
 - **Multiple Storage Backends**: Local filesystem, SMB/NAS, or S3-compatible storage
 - **Custom Paths**: Include path in filename (e.g., `videos/2024/movie.mp4`) to organize files
 - **Auto Cleanup**: Expired incomplete uploads are automatically cleaned up
-- **Progress Tracking**: Real-time upload progress via SQLite persistence
+- **Async Finalization**: Non-blocking `/complete` with phase-aware status polling
+- **Progress Tracking**: Real-time upload/finalization progress via SQLite persistence
 
 ## Architecture
 
@@ -33,11 +34,11 @@ A production-ready Rust HTTP server supporting **resumable chunked uploads** for
 │     - Updates SQLite                                            │
 │                                                                 │
 │  3. GET /upload/{id}/status (API Key)                           │
-│     - Returns progress: [{part: 0, status: "uploaded"}, ...]    │
+│     - Returns phase + upload/finalization progress               │
 │                                                                 │
 │  4. POST /upload/{id}/complete (API Key)                        │
-│     - Assembles all parts                                       │
-│     - Returns final file path                                   │
+│     - Starts async finalization (202 Accepted)                  │
+│     - Poll /status until phase=complete or failed               │
 └─────────────────────────────────────────────────────────────────┘
                               │
               ┌───────────────┼───────────────┐
@@ -168,10 +169,10 @@ Response:
 }
 ```
 
-### 5. Check Progress (for resume)
+### 5. Check Progress (for resume/finalization)
 
 ```bash
-curl -X GET "http://localhost:3000/upload/${FILE_ID}/status" \
+curl -X GET "http://localhost:3000/upload/${FILE_ID}/status?include_parts=true" \
   -H "X-API-Key: your-api-key"
 ```
 
@@ -181,47 +182,69 @@ Response:
   "file_id": "550e8400-e29b-41d4-a716-446655440000",
   "filename": "large-video.mp4",
   "total_size": 10737418240,
+  "chunk_size": 52428800,
   "total_parts": 205,
   "uploaded_parts": 100,
-  "progress_percent": 48.78,
+  "status": "pending",
+  "phase": "uploading",
+  "upload_progress_percent": 48.78,
+  "finalizing_progress_percent": 0,
+  "finalization_error": null,
+  "storage_backend": "local",
   "parts": [
-    {"part": 0, "status": "uploaded", "checksum_sha256": "..."},
-    {"part": 1, "status": "pending", "checksum_sha256": null},
+    {"part": 0, "status": "uploaded", "checksum_sha256": "...", "uploaded_at": "2026-02-07T04:20:00Z"},
+    {"part": 1, "status": "pending", "checksum_sha256": null, "uploaded_at": null},
     ...
-  ]
+  ],
+  "created_at": "2026-02-07T04:10:00Z",
+  "expires_at": "2026-02-08T04:10:00Z",
+  "final_path": null
 }
 ```
 
 ### 6. Complete Upload
 
-After all parts are uploaded:
+After all parts are uploaded, trigger finalization:
 
 ```bash
 curl -X POST "http://localhost:3000/upload/${FILE_ID}/complete" \
   -H "X-API-Key: your-api-key"
 ```
 
-Response:
+Response while finalization is running (`202 Accepted`):
 ```json
 {
   "file_id": "550e8400-e29b-41d4-a716-446655440000",
   "filename": "large-video.mp4",
   "total_size": 10737418240,
-  "status": "complete",
-  "final_path": "./uploads/files/550e8400..._large-video.mp4",
-  "storage_backend": "local"
+  "status": "finalizing",
+  "phase": "finalizing",
+  "final_path": null,
+  "storage_backend": "local",
+  "finalizing_progress_percent": 15
 }
 ```
 
-With S3 backend (and path in filename):
+Poll `/upload/{id}/status` until terminal phase:
+
+```bash
+curl -X GET "http://localhost:3000/upload/${FILE_ID}/status" \
+  -H "X-API-Key: your-api-key"
+```
+
+Completed status example:
 ```json
 {
   "file_id": "550e8400-e29b-41d4-a716-446655440000",
   "filename": "large-video.mp4",
   "total_size": 10737418240,
   "status": "complete",
-  "final_path": "s3://my-bucket/videos/2024/december/550e8400..._large-video.mp4",
-  "storage_backend": "s3"
+  "phase": "complete",
+  "upload_progress_percent": 100,
+  "finalizing_progress_percent": 100,
+  "finalization_error": null,
+  "final_path": "./uploads/files/550e8400..._large-video.mp4",
+  "storage_backend": "local"
 }
 ```
 
@@ -232,16 +255,25 @@ curl -X DELETE "http://localhost:3000/upload/${FILE_ID}" \
   -H "X-API-Key: your-api-key"
 ```
 
+Note: cancel returns `409 Conflict` while `status=finalizing`.
+
 ## API Reference
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/upload/init` | POST | API Key | Initialize upload, get part tokens |
 | `/upload/{id}/part/{n}` | PUT | JWT (per part) | Upload a single chunk |
-| `/upload/{id}/status` | GET | API Key | Get upload progress |
-| `/upload/{id}/complete` | POST | API Key | Assemble all parts |
-| `/upload/{id}` | DELETE | API Key | Cancel and cleanup |
+| `/upload/{id}/status` | GET | API Key | Get upload + finalization status (`include_parts` optional) |
+| `/upload/{id}/complete` | POST | API Key | Start/check async finalization (`202` while running, `200` when complete) |
+| `/upload/{id}` | DELETE | API Key | Cancel and cleanup (`409` if finalizing) |
 | `/health` | GET | None | Health check |
+
+### Status Lifecycle
+
+- `status`: `pending | finalizing | complete | failed`
+- `phase`: `uploading | finalizing | complete | failed`
+- `upload_progress_percent` tracks chunk upload progress (0-100)
+- `finalizing_progress_percent` tracks backend finalization progress (0-100)
 
 ## Configuration
 
@@ -258,11 +290,13 @@ curl -X DELETE "http://localhost:3000/upload/${FILE_ID}" \
 | `SMB_PASS` | | SMB password |
 | `SMB_SHARE` | `share` | SMB share name |
 | `SMB_PATH` | | Subdirectory within the share (optional) |
+| `SMB_MOUNT_POINT` | `/Volumes/uploads` | SMB mount point (for operational compatibility/scripts) |
 | `S3_ENDPOINT` | AWS default | S3 endpoint URL |
 | `S3_BUCKET` | `uploads` | S3 bucket name |
 | `S3_REGION` | `us-east-1` | S3 region |
 | `CHUNK_SIZE_MB` | `50` | Chunk size in MB |
 | `UPLOAD_TTL_HOURS` | `24` | Hours before incomplete uploads expire |
+| `MAX_CONCURRENT_FINALIZATIONS` | `4` | Limit of concurrent finalization jobs |
 | `DATABASE_PATH` | `./uploads.db` | SQLite database path |
 | `SERVER_PORT` | `3000` | Server port |
 
@@ -270,16 +304,18 @@ curl -X DELETE "http://localhost:3000/upload/${FILE_ID}" \
 
 1. Client starts upload with `POST /upload/init`
 2. Client uploads chunks in parallel or sequence
-3. If interrupted, client calls `GET /upload/{id}/status`
+3. If interrupted, client calls `GET /upload/{id}/status?include_parts=true`
 4. Response shows which parts are `pending` vs `uploaded`
 5. Client re-uploads only `pending` parts using original tokens
 6. When all parts uploaded, call `POST /upload/{id}/complete`
+7. Poll `GET /upload/{id}/status` until `phase=complete` (or handle `phase=failed`)
 
 ## Example Client (Python)
 
 ```python
 import requests
 import os
+import time
 
 API_KEY = "your-api-key"
 BASE_URL = "http://localhost:3000"
@@ -333,13 +369,31 @@ def upload_file(file_path, target_path=None):
             result = resp.json()
             print(f"Part {part_num}: {result['uploaded_parts']}/{result['total_parts']}")
     
-    # 3. Complete upload
+    # 3. Trigger async finalization
     resp = requests.post(
         f"{BASE_URL}/upload/{file_id}/complete",
         headers={"X-API-Key": API_KEY}
     )
-    
-    print(f"Upload complete: {resp.json()['final_path']}")
+    resp.raise_for_status()
+
+    # 4. Poll status until finalization is complete
+    while True:
+        status_resp = requests.get(
+            f"{BASE_URL}/upload/{file_id}/status",
+            headers={"X-API-Key": API_KEY}
+        )
+        status_resp.raise_for_status()
+        status = status_resp.json()
+
+        phase = status.get("phase")
+        if phase == "complete":
+            print(f"Upload complete: {status['final_path']}")
+            break
+        if phase == "failed":
+            raise RuntimeError(f"Finalization failed: {status.get('finalization_error')}")
+
+        print(f"Finalizing... {status.get('finalizing_progress_percent', 0)}%")
+        time.sleep(2)
 
 if __name__ == "__main__":
     # Simple upload (file goes to default location)
@@ -359,7 +413,7 @@ Official SDK for browser and Node.js: [`chunked-uploader-sdk`](https://www.npmjs
 - **Automatic Chunking**: Files split into 50MB chunks (Cloudflare compatible)
 - **Parallel Uploads**: Configurable concurrency for faster uploads
 - **Resumable**: Continue interrupted uploads from where they left off
-- **Progress Tracking**: Real-time progress callbacks
+- **Phase Progress Tracking**: `uploading -> finalizing -> complete`
 - **Retry Logic**: Automatic retry for failed chunks
 - **TypeScript**: Full type definitions included
 - **Isomorphic**: Works in both browser and Node.js
@@ -411,8 +465,13 @@ input.addEventListener('change', async () => {
   const result = await uploader.uploadFile(file, {
     concurrency: 5, // Upload 5 parts simultaneously
     onProgress: (event) => {
-      progressBar.style.width = `${event.overallProgress}%`;
-      statusText.textContent = `Uploading part ${event.uploadedParts}/${event.totalParts}`;
+      progressBar.style.width = `${event.phaseProgress}%`;
+      statusText.textContent =
+        event.phase === 'uploading'
+          ? `Uploading ${event.uploadProgress.toFixed(0)}%`
+          : event.phase === 'finalizing'
+            ? `Finalizing ${event.finalizingProgress.toFixed(0)}%`
+            : 'Complete';
     },
     onPartComplete: (result) => {
       if (!result.success) {
@@ -497,6 +556,10 @@ interface ChunkedUploaderConfig {
   retryAttempts?: number;
   /** Delay between retries in milliseconds (default: 1000) */
   retryDelay?: number;
+  /** Poll interval while waiting for finalization (default: 2000) */
+  finalizePollIntervalMs?: number;
+  /** Finalization timeout in milliseconds (default: 7200000 / 2h) */
+  finalizeTimeoutMs?: number;
   /** Custom fetch implementation */
   fetch?: typeof fetch;
 }
@@ -510,8 +573,8 @@ interface ChunkedUploaderConfig {
 | `resumeUpload(uploadId, file, options?)` | Resume an interrupted upload |
 | `initUpload(filename, totalSize, webhookUrl?)` | Initialize an upload session manually |
 | `uploadPart(uploadId, partNumber, token, data, signal?)` | Upload a single chunk |
-| `getStatus(uploadId)` | Get upload progress and status |
-| `completeUpload(uploadId)` | Complete an upload (assemble all parts) |
+| `getStatus(uploadId, options?)` | Get upload/finalization status (`includeParts` optional) |
+| `completeUpload(uploadId)` | Trigger async finalization and wait for completion |
 | `cancelUpload(uploadId)` | Cancel an upload and cleanup |
 | `healthCheck()` | Check server health |
 
@@ -669,21 +732,21 @@ SMB_PASS=your-password         # SMB password
 SMB_SHARE=uploads              # Share name on the server
 SMB_PATH=videos                # Optional: subdirectory within share
 
-# Optional: Fast local storage for temporary chunks (recommended)
+# Optional: local temp storage (used for compatibility cleanup paths)
 TEMP_STORAGE_PATH=/tmp/chunked-uploads
 ```
 
 ### SMB Storage Architecture
 
-The SMB backend uses a hybrid approach for optimal performance:
+The SMB backend uses direct writes with async finalization:
 
-1. **Chunks are stored locally** on fast storage (SSD) during upload
-2. **Final assembled file is transferred to SMB** after all chunks complete
-3. **Automatic cleanup** of local temporary files
+1. **Each uploaded chunk is written directly to an SMB `.partial` file** at the correct offset
+2. **`POST /complete` starts finalization** (verification + rename `.partial` to final file)
+3. **Automatic cleanup/recovery** for stale incomplete/finalizing uploads
 
 This design ensures:
-- Fast chunk uploads (no network latency per chunk)
-- Reliable large file transfers to NAS
+- No long synchronous assembly step at 100% upload
+- Reliable large file finalization with observable progress
 - Works with any SMB 3.0+ compatible server (Synology, QNAP, TrueNAS, Windows, Samba)
 
 ### Building with SMB Support
@@ -730,4 +793,3 @@ Common issues:
 ## License
 
 MIT
-

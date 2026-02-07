@@ -37,6 +37,7 @@ pub struct Config {
     pub chunk_size_mb: u64,
     pub chunk_size_bytes: u64,
     pub upload_ttl_hours: u64,
+    pub max_concurrent_finalizations: usize,
 
     // Server
     pub database_path: String,
@@ -92,6 +93,11 @@ impl Config {
             .parse()
             .context("Invalid UPLOAD_TTL_HOURS")?;
 
+        let max_concurrent_finalizations: usize = env::var("MAX_CONCURRENT_FINALIZATIONS")
+            .unwrap_or_else(|_| "4".to_string())
+            .parse()
+            .context("Invalid MAX_CONCURRENT_FINALIZATIONS")?;
+
         let database_path =
             env::var("DATABASE_PATH").unwrap_or_else(|_| "./uploads.db".to_string());
 
@@ -119,9 +125,9 @@ impl Config {
             chunk_size_mb,
             chunk_size_bytes: chunk_size_mb * 1024 * 1024,
             upload_ttl_hours,
+            max_concurrent_finalizations,
             database_path,
             server_port,
         })
     }
 }
-

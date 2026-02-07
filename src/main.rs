@@ -12,6 +12,7 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -26,6 +27,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub db: Arc<Database>,
     pub storage: Arc<dyn StorageBackend>,
+    pub finalization_semaphore: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -52,6 +54,15 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::new(&config.database_path)?;
     db.run_migrations()?;
     let db = Arc::new(db);
+
+    // Mark any interrupted finalizations as failed after server restarts.
+    let recovered = db.mark_stale_finalizing_failed_on_boot()?;
+    if recovered > 0 {
+        tracing::warn!(
+            "Recovered {} stale finalizing uploads and marked them failed",
+            recovered
+        );
+    }
 
     // Initialize storage backend
     let storage: Arc<dyn StorageBackend> = match config.storage_backend {
@@ -91,6 +102,9 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         db: db.clone(),
         storage,
+        finalization_semaphore: Arc::new(Semaphore::new(
+            config.max_concurrent_finalizations.max(1),
+        )),
     };
 
     // Start cleanup service

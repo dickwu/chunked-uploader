@@ -95,6 +95,10 @@ pub async fn init_upload(
         final_path: None,
         checksum_sha256: request.checksum_sha256,
         webhook_url: request.webhook_url,
+        finalization_started_at: None,
+        finalization_updated_at: None,
+        finalization_error: None,
+        finalizing_progress_percent: 0,
         created_at: now.timestamp(),
         updated_at: now.timestamp(),
         expires_at: expires_timestamp,
@@ -159,4 +163,3 @@ pub async fn init_upload(
         expires_at: expires_at.to_rfc3339(),
     }))
 }
-

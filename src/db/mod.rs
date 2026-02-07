@@ -5,6 +5,8 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 
+use crate::db::schema::Upload;
+
 use crate::error::{AppError, Result};
 
 pub type DbPool = Pool<SqliteConnectionManager>;
@@ -44,6 +46,10 @@ impl Database {
                 final_path TEXT,
                 checksum_sha256 TEXT,
                 webhook_url TEXT,
+                finalization_started_at INTEGER,
+                finalization_updated_at INTEGER,
+                finalization_error TEXT,
+                finalizing_progress_percent INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL
@@ -55,6 +61,13 @@ impl Database {
         // Add columns if they don't exist (migrations for existing DBs)
         let _ = conn.execute("ALTER TABLE uploads ADD COLUMN webhook_url TEXT", []);
         let _ = conn.execute("ALTER TABLE uploads ADD COLUMN target_path TEXT", []);
+        let _ = conn.execute("ALTER TABLE uploads ADD COLUMN finalization_started_at INTEGER", []);
+        let _ = conn.execute("ALTER TABLE uploads ADD COLUMN finalization_updated_at INTEGER", []);
+        let _ = conn.execute("ALTER TABLE uploads ADD COLUMN finalization_error TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE uploads ADD COLUMN finalizing_progress_percent INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         // Create upload_parts table
         conn.execute(
@@ -100,36 +113,66 @@ impl Database {
             .map_err(|e| AppError::Internal(format!("Failed to get database connection: {}", e)))
     }
 
-    /// Delete expired uploads and return their IDs for cleanup
-    pub fn delete_expired_uploads(&self) -> Result<Vec<String>> {
+    /// List expired pending uploads for cleanup.
+    pub fn list_expired_pending_uploads(&self) -> Result<Vec<Upload>> {
         let conn = self.get_conn()?;
         let now = chrono::Utc::now().timestamp();
 
-        // First get the IDs of expired uploads
         let mut stmt = conn.prepare(
-            "SELECT id FROM uploads WHERE expires_at < ?1 AND status = 'pending'",
+            r#"
+            SELECT id, filename, total_size, chunk_size, total_parts,
+                   status, storage_backend, target_path, final_path, checksum_sha256,
+                   webhook_url, finalization_started_at, finalization_updated_at,
+                   finalization_error, finalizing_progress_percent,
+                   created_at, updated_at, expires_at
+            FROM uploads
+            WHERE expires_at < ?1 AND status = 'pending'
+            "#,
         )?;
-        let expired_ids: Vec<String> = stmt
-            .query_map(params![now], |row| row.get(0))?
+        let uploads: Vec<Upload> = stmt
+            .query_map(params![now], |row| {
+                Ok(Upload {
+                    id: row.get(0)?,
+                    filename: row.get(1)?,
+                    total_size: row.get(2)?,
+                    chunk_size: row.get(3)?,
+                    total_parts: row.get(4)?,
+                    status: row.get::<_, String>(5)?.into(),
+                    storage_backend: row.get(6)?,
+                    target_path: row.get(7)?,
+                    final_path: row.get(8)?,
+                    checksum_sha256: row.get(9)?,
+                    webhook_url: row.get(10)?,
+                    finalization_started_at: row.get(11)?,
+                    finalization_updated_at: row.get(12)?,
+                    finalization_error: row.get(13)?,
+                    finalizing_progress_percent: row.get(14)?,
+                    created_at: row.get(15)?,
+                    updated_at: row.get(16)?,
+                    expires_at: row.get(17)?,
+                })
+            })?
             .filter_map(|r| r.ok())
             .collect();
 
-        if !expired_ids.is_empty() {
-            // Delete the parts first (foreign key)
-            for id in &expired_ids {
-                conn.execute("DELETE FROM upload_parts WHERE upload_id = ?1", params![id])?;
-            }
+        Ok(uploads)
+    }
 
-            // Then delete the uploads
-            conn.execute(
-                "DELETE FROM uploads WHERE expires_at < ?1 AND status = 'pending'",
-                params![now],
-            )?;
-
-            tracing::info!("Deleted {} expired uploads", expired_ids.len());
-        }
-
-        Ok(expired_ids)
+    /// Mark finalizing uploads as failed on startup recovery.
+    pub fn mark_stale_finalizing_failed_on_boot(&self) -> Result<usize> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().timestamp();
+        let affected = conn.execute(
+            r#"
+            UPDATE uploads
+            SET status = 'failed',
+                finalization_error = COALESCE(finalization_error, 'Server restarted during finalization'),
+                finalization_updated_at = ?1,
+                updated_at = ?1
+            WHERE status = 'finalizing'
+            "#,
+            params![now],
+        )?;
+        Ok(affected)
     }
 }
-

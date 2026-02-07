@@ -96,10 +96,7 @@ pub async fn upload_part(
     );
 
     // Store the part
-    state
-        .storage
-        .store_part(&upload_id, part_num, body)
-        .await?;
+    state.storage.store_part(&upload, part_num, body).await?;
 
     // Update part status in database
     state
@@ -118,4 +115,3 @@ pub async fn upload_part(
         total_parts: upload.total_parts,
     }))
 }
-

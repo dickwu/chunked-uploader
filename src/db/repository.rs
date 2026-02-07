@@ -14,8 +14,13 @@ impl Database {
             INSERT INTO uploads (
                 id, filename, total_size, chunk_size, total_parts,
                 status, storage_backend, target_path, final_path, checksum_sha256,
-                webhook_url, created_at, updated_at, expires_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                webhook_url, finalization_started_at, finalization_updated_at,
+                finalization_error, finalizing_progress_percent,
+                created_at, updated_at, expires_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+            )
             "#,
             params![
                 upload.id,
@@ -29,6 +34,10 @@ impl Database {
                 upload.final_path,
                 upload.checksum_sha256,
                 upload.webhook_url,
+                upload.finalization_started_at,
+                upload.finalization_updated_at,
+                upload.finalization_error,
+                upload.finalizing_progress_percent,
                 upload.created_at,
                 upload.updated_at,
                 upload.expires_at,
@@ -43,7 +52,9 @@ impl Database {
             r#"
             SELECT id, filename, total_size, chunk_size, total_parts,
                    status, storage_backend, target_path, final_path, checksum_sha256,
-                   webhook_url, created_at, updated_at, expires_at
+                   webhook_url, finalization_started_at, finalization_updated_at,
+                   finalization_error, finalizing_progress_percent,
+                   created_at, updated_at, expires_at
             FROM uploads WHERE id = ?1
             "#,
         )?;
@@ -61,9 +72,13 @@ impl Database {
                 final_path: row.get(8)?,
                 checksum_sha256: row.get(9)?,
                 webhook_url: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                expires_at: row.get(13)?,
+                finalization_started_at: row.get(11)?,
+                finalization_updated_at: row.get(12)?,
+                finalization_error: row.get(13)?,
+                finalizing_progress_percent: row.get(14)?,
+                created_at: row.get(15)?,
+                updated_at: row.get(16)?,
+                expires_at: row.get(17)?,
             })
         }).map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => {
@@ -81,6 +96,77 @@ impl Database {
         conn.execute(
             "UPDATE uploads SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status.to_string(), now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn try_start_finalization(&self, id: &str) -> Result<bool> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().timestamp();
+        let affected = conn.execute(
+            r#"
+            UPDATE uploads
+            SET status = 'finalizing',
+                finalization_started_at = ?1,
+                finalization_updated_at = ?1,
+                finalization_error = NULL,
+                finalizing_progress_percent = 0,
+                updated_at = ?1
+            WHERE id = ?2 AND (status = 'pending' OR status = 'failed')
+            "#,
+            params![now, id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn update_finalizing_progress(&self, id: &str, progress_percent: i32) -> Result<()> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            r#"
+            UPDATE uploads
+            SET finalizing_progress_percent = ?1,
+                finalization_updated_at = ?2,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+            params![progress_percent.clamp(0, 100), now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_finalization_complete(&self, id: &str, final_path: &str) -> Result<()> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            r#"
+            UPDATE uploads
+            SET status = 'complete',
+                final_path = ?1,
+                finalizing_progress_percent = 100,
+                finalization_error = NULL,
+                finalization_updated_at = ?2,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+            params![final_path, now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_finalization_failed(&self, id: &str, error: &str) -> Result<()> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            r#"
+            UPDATE uploads
+            SET status = 'failed',
+                finalization_error = ?1,
+                finalization_updated_at = ?2,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+            params![error, now, id],
         )?;
         Ok(())
     }
@@ -223,4 +309,3 @@ impl Database {
         Ok(uploaded_count == upload.total_parts)
     }
 }
-

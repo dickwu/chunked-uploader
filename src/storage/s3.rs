@@ -15,6 +15,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::StorageBackend;
 use crate::config::Config;
+use crate::db::schema::Upload;
 use crate::error::{AppError, Result};
 
 pub struct S3Storage {
@@ -102,10 +103,11 @@ impl S3Storage {
 impl StorageBackend for S3Storage {
     async fn store_part(
         &self,
-        upload_id: &str,
+        upload: &Upload,
         part_number: i32,
         data: Bytes,
     ) -> Result<String> {
+        let upload_id = &upload.id;
         let part_path = self.get_part_path(upload_id, part_number);
         let data_len = data.len();
 

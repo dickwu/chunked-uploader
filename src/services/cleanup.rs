@@ -39,18 +39,27 @@ impl CleanupService {
     pub async fn cleanup_expired(&self) {
         tracing::debug!("Running cleanup for expired uploads...");
 
-        match self.db.delete_expired_uploads() {
-            Ok(expired_ids) => {
-                for upload_id in expired_ids {
-                    // Clean up storage for each expired upload
-                    if let Err(e) = self.storage.delete_parts(&upload_id).await {
+        match self.db.list_expired_pending_uploads() {
+            Ok(expired_uploads) => {
+                for upload in expired_uploads {
+                    if let Err(e) = self.storage.cleanup_incomplete_upload(&upload).await {
                         tracing::warn!(
-                            "Failed to delete parts for expired upload {}: {}",
-                            upload_id,
+                            "Failed to cleanup storage for expired upload {}: {}",
+                            upload.id,
                             e
                         );
                     }
-                    tracing::info!("Cleaned up expired upload: {}", upload_id);
+
+                    if let Err(e) = self.db.delete_upload(&upload.id) {
+                        tracing::warn!(
+                            "Failed to delete expired upload {} from database: {}",
+                            upload.id,
+                            e
+                        );
+                        continue;
+                    }
+
+                    tracing::info!("Cleaned up expired upload: {}", upload.id);
                 }
             }
             Err(e) => {
@@ -59,4 +68,3 @@ impl CleanupService {
         }
     }
 }
-
