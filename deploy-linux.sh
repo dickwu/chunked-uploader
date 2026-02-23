@@ -29,12 +29,24 @@ fi
 
 # --- Deploy mode (default: create systemd service and enable) ---
 
+# Resolve STORAGE_BACKEND from .env
+STORAGE_BACKEND=""
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    STORAGE_BACKEND=$(grep -E '^STORAGE_BACKEND=' "$SCRIPT_DIR/.env" | cut -d'=' -f2 | tr -d ' \t\r\n"'"'")
+fi
+
+case "$STORAGE_BACKEND" in
+    s3)  CARGO_FEATURES="--features s3"  ;;
+    smb) CARGO_FEATURES="--features smb" ;;
+    *)   CARGO_FEATURES=""               ;;
+esac
+
 # Build the project (before requiring root)
 echo "Updating dependencies..."
 cargo update
 
-echo "Building release binary..."
-cargo build --release
+echo "Building release binary (STORAGE_BACKEND=${STORAGE_BACKEND:-local})..."
+cargo build --release $CARGO_FEATURES
 if [ $? -ne 0 ]; then
     echo "Build failed!"
     exit 1
