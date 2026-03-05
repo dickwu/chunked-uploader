@@ -1,6 +1,6 @@
 [package]
 name = "chunked-uploader"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "A resumable chunked upload server supporting large files (>10GB) with Cloudflare compatibility"
 license = "MIT"

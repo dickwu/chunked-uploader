@@ -22,7 +22,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
-use super::StorageBackend;
+use super::{build_response_path, sanitize_target_path, StorageBackend};
 use crate::config::Config;
 use crate::db::schema::Upload;
 use crate::error::{AppError, Result};
@@ -193,7 +193,7 @@ impl SmbStorage {
         }
     }
 
-    fn verify_local_write(path: &PathBuf) -> Result<()> {
+    fn verify_local_write(path: &Path) -> Result<()> {
         let test_file = path.join(".write_test");
         let mut file = std::fs::File::create(&test_file).map_err(|e| {
             AppError::Storage(format!("No write permission for parts directory: {}", e))
@@ -255,7 +255,6 @@ impl SmbStorage {
                         attributes: FileAttributes::new().with_directory(true),
                         disposition: CreateDisposition::Create,
                         options: CreateOptions::new().with_directory_file(true),
-                        ..Default::default()
                     };
 
                     match client.create_file(&current_path, &create_args).await {
@@ -286,13 +285,6 @@ impl SmbStorage {
         Ok(())
     }
 
-    fn sanitize_target_path(path: &str) -> String {
-        path.trim_matches('/')
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_')
-            .collect()
-    }
-
     fn get_smb_file_path(
         &self,
         upload_id: &str,
@@ -309,7 +301,7 @@ impl SmbStorage {
 
         match target_path {
             Some(path) => {
-                let clean_path = Self::sanitize_target_path(path);
+                let clean_path = sanitize_target_path(path);
                 if clean_path.is_empty() {
                     if base_path.is_empty() {
                         final_filename
@@ -342,31 +334,6 @@ impl SmbStorage {
             "{}.partial",
             self.get_smb_file_path(upload_id, filename, target_path)
         )
-    }
-
-    fn get_smb_response_path(
-        upload_id: &str,
-        filename: &str,
-        target_path: Option<&str>,
-    ) -> String {
-        let safe_filename = Path::new(filename)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unnamed");
-
-        let final_filename = format!("{}_{}", upload_id, safe_filename);
-
-        match target_path {
-            Some(path) => {
-                let clean_path = Self::sanitize_target_path(path);
-                if clean_path.is_empty() {
-                    final_filename
-                } else {
-                    format!("{}/{}", clean_path, final_filename)
-                }
-            }
-            None => format!("files/{}", final_filename),
-        }
     }
 
     fn normalize_relative_path(config: &SmbConfig, path: &str) -> String {
@@ -997,7 +964,7 @@ impl StorageBackend for SmbStorage {
 
                     self.remove_upload_lock(upload_id).await;
 
-                    let response_path = Self::get_smb_response_path(
+                    let response_path = build_response_path(
                         upload_id,
                         &upload.filename,
                         upload.target_path.as_deref(),

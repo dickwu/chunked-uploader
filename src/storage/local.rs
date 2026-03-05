@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use super::StorageBackend;
+use super::{build_response_path, sanitize_target_path, StorageBackend};
 use crate::db::schema::Upload;
 use crate::error::{AppError, Result};
 
@@ -50,7 +50,7 @@ impl LocalStorage {
     }
 
     /// Verify write permission by creating and deleting a test file
-    fn verify_write_permission(path: &PathBuf, name: &str) -> Result<()> {
+    fn verify_write_permission(path: &Path, name: &str) -> Result<()> {
         use std::io::Write;
 
         let test_file = path.join(".write_test");
@@ -83,7 +83,6 @@ impl LocalStorage {
     }
 
     fn get_final_file_path(&self, upload_id: &str, filename: &str, target_path: Option<&str>) -> PathBuf {
-        // Sanitize filename to prevent path traversal
         let safe_filename = Path::new(filename)
             .file_name()
             .and_then(|n| n.to_str())
@@ -91,16 +90,9 @@ impl LocalStorage {
 
         let final_filename = format!("{}_{}", upload_id, safe_filename);
 
-        // Use custom path if provided
         match target_path {
             Some(path) => {
-                // Sanitize path (remove leading slashes, prevent traversal)
-                let clean_path: String = path
-                    .trim_matches('/')
-                    .chars()
-                    .filter(|c| c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_')
-                    .collect();
-                
+                let clean_path = sanitize_target_path(path);
                 if clean_path.is_empty() {
                     self.final_path.join(&final_filename)
                 } else {
@@ -108,6 +100,17 @@ impl LocalStorage {
                 }
             }
             None => self.final_path.join(&final_filename),
+        }
+    }
+
+    /// Resolve a client-facing response path back to an absolute filesystem path.
+    fn resolve_response_path(&self, path: &str) -> PathBuf {
+        if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else if let Some(rest) = path.strip_prefix("files/") {
+            self.final_path.join(rest)
+        } else {
+            self.final_path.join(path)
         }
     }
 }
@@ -243,6 +246,48 @@ impl StorageBackend for LocalStorage {
         Ok(final_path.to_string_lossy().to_string())
     }
 
+    async fn verify_upload_ready(&self, upload: &Upload) -> Result<()> {
+        let upload_id = &upload.id;
+        let mut total_bytes: u64 = 0;
+
+        for part_num in 0..upload.total_parts {
+            let part_path = self.get_part_path(upload_id, part_num);
+            let metadata = fs::metadata(&part_path).await.map_err(|e| {
+                AppError::Storage(format!(
+                    "Verification failed: part {} missing for upload {}: {}",
+                    part_num, upload_id, e
+                ))
+            })?;
+            total_bytes += metadata.len();
+        }
+
+        let expected = upload.total_size as u64;
+        if total_bytes != expected {
+            return Err(AppError::Storage(format!(
+                "Verification failed: size mismatch for upload {} (expected {}, got {})",
+                upload_id, expected, total_bytes
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn finalize_upload(&self, upload: &Upload) -> Result<String> {
+        self.assemble_parts(
+            &upload.id,
+            &upload.filename,
+            upload.total_parts,
+            upload.target_path.as_deref(),
+        )
+        .await?;
+
+        Ok(build_response_path(
+            &upload.id,
+            &upload.filename,
+            upload.target_path.as_deref(),
+        ))
+    }
+
     async fn delete_parts(&self, upload_id: &str) -> Result<()> {
         let parts_dir = self.get_upload_parts_dir(upload_id);
 
@@ -258,10 +303,9 @@ impl StorageBackend for LocalStorage {
     }
 
     async fn delete_file(&self, path: &str) -> Result<()> {
-        let file_path = PathBuf::from(path);
+        let file_path = self.resolve_response_path(path);
 
         if file_path.exists() {
-            // All files are local - use async I/O
             fs::remove_file(&file_path).await.map_err(|e| {
                 AppError::Storage(format!("Failed to delete file {}: {}", path, e))
             })?;
