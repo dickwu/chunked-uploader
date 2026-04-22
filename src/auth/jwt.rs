@@ -86,4 +86,3 @@ mod tests {
         assert_eq!(hash.len(), 64); // SHA256 produces 64 hex chars
     }
 }
-

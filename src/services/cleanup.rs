@@ -12,12 +12,12 @@ pub struct CleanupService {
 }
 
 impl CleanupService {
-    pub fn new(
-        db: Arc<Database>,
-        storage: Arc<dyn StorageBackend>,
-        config: Arc<Config>,
-    ) -> Self {
-        Self { db, storage, config }
+    pub fn new(db: Arc<Database>, storage: Arc<dyn StorageBackend>, config: Arc<Config>) -> Self {
+        Self {
+            db,
+            storage,
+            config,
+        }
     }
 
     /// Run the cleanup service indefinitely

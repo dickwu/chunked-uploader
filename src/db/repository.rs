@@ -59,33 +59,35 @@ impl Database {
             "#,
         )?;
 
-        let upload = stmt.query_row(params![id], |row| {
-            Ok(Upload {
-                id: row.get(0)?,
-                filename: row.get(1)?,
-                total_size: row.get(2)?,
-                chunk_size: row.get(3)?,
-                total_parts: row.get(4)?,
-                status: row.get::<_, String>(5)?.into(),
-                storage_backend: row.get(6)?,
-                target_path: row.get(7)?,
-                final_path: row.get(8)?,
-                checksum_sha256: row.get(9)?,
-                webhook_url: row.get(10)?,
-                finalization_started_at: row.get(11)?,
-                finalization_updated_at: row.get(12)?,
-                finalization_error: row.get(13)?,
-                finalizing_progress_percent: row.get(14)?,
-                created_at: row.get(15)?,
-                updated_at: row.get(16)?,
-                expires_at: row.get(17)?,
+        let upload = stmt
+            .query_row(params![id], |row| {
+                Ok(Upload {
+                    id: row.get(0)?,
+                    filename: row.get(1)?,
+                    total_size: row.get(2)?,
+                    chunk_size: row.get(3)?,
+                    total_parts: row.get(4)?,
+                    status: row.get::<_, String>(5)?.into(),
+                    storage_backend: row.get(6)?,
+                    target_path: row.get(7)?,
+                    final_path: row.get(8)?,
+                    checksum_sha256: row.get(9)?,
+                    webhook_url: row.get(10)?,
+                    finalization_started_at: row.get(11)?,
+                    finalization_updated_at: row.get(12)?,
+                    finalization_error: row.get(13)?,
+                    finalizing_progress_percent: row.get(14)?,
+                    created_at: row.get(15)?,
+                    updated_at: row.get(16)?,
+                    expires_at: row.get(17)?,
+                })
             })
-        }).map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                AppError::NotFound(format!("Upload {} not found", id))
-            }
-            _ => AppError::Database(e),
-        })?;
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    AppError::NotFound(format!("Upload {} not found", id))
+                }
+                _ => AppError::Database(e),
+            })?;
 
         Ok(upload)
     }
@@ -249,22 +251,25 @@ impl Database {
             "#,
         )?;
 
-        let part = stmt.query_row(params![upload_id, part_number], |row| {
-            Ok(UploadPart {
-                upload_id: row.get(0)?,
-                part_number: row.get(1)?,
-                token_hash: row.get(2)?,
-                status: row.get::<_, String>(3)?.into(),
-                size: row.get(4)?,
-                checksum_sha256: row.get(5)?,
-                uploaded_at: row.get(6)?,
+        let part = stmt
+            .query_row(params![upload_id, part_number], |row| {
+                Ok(UploadPart {
+                    upload_id: row.get(0)?,
+                    part_number: row.get(1)?,
+                    token_hash: row.get(2)?,
+                    status: row.get::<_, String>(3)?.into(),
+                    size: row.get(4)?,
+                    checksum_sha256: row.get(5)?,
+                    uploaded_at: row.get(6)?,
+                })
             })
-        }).map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                AppError::NotFound(format!("Part {} not found for upload {}", part_number, upload_id))
-            }
-            _ => AppError::Database(e),
-        })?;
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => AppError::NotFound(format!(
+                    "Part {} not found for upload {}",
+                    part_number, upload_id
+                )),
+                _ => AppError::Database(e),
+            })?;
 
         Ok(part)
     }

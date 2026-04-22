@@ -24,9 +24,9 @@ pub struct Config {
     pub smb_port: u16,
     pub smb_user: String,
     pub smb_pass: String,
-    pub smb_share: String,          // Share name on the server
-    pub smb_path: String,           // Subdirectory within the share
-    pub smb_mount_point: String,    // Local mount point
+    pub smb_share: String,       // Share name on the server
+    pub smb_path: String,        // Subdirectory within the share
+    pub smb_mount_point: String, // Local mount point
 
     // S3 Configuration
     pub s3_endpoint: Option<String>,
@@ -63,8 +63,12 @@ impl Config {
             env::var("LOCAL_STORAGE_PATH").unwrap_or_else(|_| "./uploads".to_string());
 
         // Temp storage for parts - defaults to system temp dir for fast local I/O
-        let temp_storage_path = env::var("TEMP_STORAGE_PATH")
-            .unwrap_or_else(|_| env::temp_dir().join("chunked-uploads").to_string_lossy().to_string());
+        let temp_storage_path = env::var("TEMP_STORAGE_PATH").unwrap_or_else(|_| {
+            env::temp_dir()
+                .join("chunked-uploads")
+                .to_string_lossy()
+                .to_string()
+        });
 
         // SMB/NAS Configuration
         let smb_host = env::var("SMB_HOST").unwrap_or_else(|_| "localhost".to_string());
@@ -76,8 +80,8 @@ impl Config {
         let smb_pass = env::var("SMB_PASS").unwrap_or_default();
         let smb_share = env::var("SMB_SHARE").unwrap_or_else(|_| "share".to_string());
         let smb_path = env::var("SMB_PATH").unwrap_or_default(); // Subdirectory within share
-        let smb_mount_point = env::var("SMB_MOUNT_POINT")
-            .unwrap_or_else(|_| "/Volumes/uploads".to_string());
+        let smb_mount_point =
+            env::var("SMB_MOUNT_POINT").unwrap_or_else(|_| "/Volumes/uploads".to_string());
 
         let s3_endpoint = env::var("S3_ENDPOINT").ok();
         let s3_bucket = env::var("S3_BUCKET").unwrap_or_else(|_| "uploads".to_string());

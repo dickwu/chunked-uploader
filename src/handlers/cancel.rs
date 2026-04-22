@@ -29,7 +29,11 @@ pub async fn cancel_upload(
     // Get upload record
     let upload = state.db.get_upload(&upload_id)?;
 
-    tracing::info!("Cancelling upload: id={}, status={}", upload_id, upload.status);
+    tracing::info!(
+        "Cancelling upload: id={}, status={}",
+        upload_id,
+        upload.status
+    );
 
     if upload.status == UploadStatus::Finalizing {
         return Err(crate::error::AppError::Conflict(

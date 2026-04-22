@@ -3,6 +3,8 @@
 //! Uses local fast storage for parts, then uploads final assembled file to S3.
 //! This avoids S3 multipart upload complexity and minimum part size restrictions.
 
+#![cfg(feature = "s3")]
+
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client};
@@ -11,7 +13,7 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use super::{build_response_path, sanitize_target_path, StorageBackend};
+use super::StorageBackend;
 use crate::config::Config;
 use crate::db::schema::Upload;
 use crate::error::{AppError, Result};
@@ -39,7 +41,7 @@ impl S3Storage {
 
         // Use temp storage path for parts (like SMB does)
         let parts_path = PathBuf::from(&config.temp_storage_path).join("parts");
-        
+
         // Create local parts directory
         std::fs::create_dir_all(&parts_path)
             .map_err(|e| AppError::Storage(format!("Failed to create parts directory: {}", e)))?;
@@ -70,35 +72,38 @@ impl S3Storage {
     }
 
     fn get_final_key(&self, upload_id: &str, filename: &str, target_path: Option<&str>) -> String {
-        let safe_filename = std::path::Path::new(filename)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unnamed");
+        // Sanitize filename
+        let safe_filename = filename
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+            .collect::<String>();
 
-        let final_filename = format!("{}_{}", upload_id, safe_filename);
-
+        // Use custom path if provided, otherwise default to "files/"
         match target_path {
             Some(path) => {
-                let clean_path = sanitize_target_path(path);
+                // Sanitize and normalize path (remove leading/trailing slashes)
+                let clean_path = path
+                    .trim_matches('/')
+                    .chars()
+                    .filter(|c| {
+                        c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_'
+                    })
+                    .collect::<String>();
+
                 if clean_path.is_empty() {
-                    final_filename
+                    format!("{}_{}", upload_id, safe_filename)
                 } else {
-                    format!("{}/{}", clean_path, final_filename)
+                    format!("{}/{}_{}", clean_path, upload_id, safe_filename)
                 }
             }
-            None => format!("files/{}", final_filename),
+            None => format!("files/{}_{}", upload_id, safe_filename),
         }
     }
 }
 
 #[async_trait]
 impl StorageBackend for S3Storage {
-    async fn store_part(
-        &self,
-        upload: &Upload,
-        part_number: i32,
-        data: Bytes,
-    ) -> Result<String> {
+    async fn store_part(&self, upload: &Upload, part_number: i32, data: Bytes) -> Result<String> {
         let upload_id = &upload.id;
         let part_path = self.get_part_path(upload_id, part_number);
         let data_len = data.len();
@@ -110,17 +115,17 @@ impl StorageBackend for S3Storage {
             })?;
         }
 
-        let mut file = fs::File::create(&part_path).await.map_err(|e| {
-            AppError::Storage(format!("Failed to create part file: {}", e))
-        })?;
+        let mut file = fs::File::create(&part_path)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to create part file: {}", e)))?;
 
-        file.write_all(&data).await.map_err(|e| {
-            AppError::Storage(format!("Failed to write part data: {}", e))
-        })?;
+        file.write_all(&data)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to write part data: {}", e)))?;
 
-        file.flush().await.map_err(|e| {
-            AppError::Storage(format!("Failed to flush part data: {}", e))
-        })?;
+        file.flush()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to flush part data: {}", e)))?;
 
         tracing::debug!(
             "Stored part {} for upload {} ({} bytes) locally",
@@ -229,48 +234,6 @@ impl StorageBackend for S3Storage {
         Ok(final_path)
     }
 
-    async fn verify_upload_ready(&self, upload: &Upload) -> Result<()> {
-        let upload_id = &upload.id;
-        let mut total_bytes: u64 = 0;
-
-        for part_num in 0..upload.total_parts {
-            let part_path = self.get_part_path(upload_id, part_num);
-            let metadata = fs::metadata(&part_path).await.map_err(|e| {
-                AppError::Storage(format!(
-                    "Verification failed: part {} missing for upload {}: {}",
-                    part_num, upload_id, e
-                ))
-            })?;
-            total_bytes += metadata.len();
-        }
-
-        let expected = upload.total_size as u64;
-        if total_bytes != expected {
-            return Err(AppError::Storage(format!(
-                "Verification failed: size mismatch for upload {} (expected {}, got {})",
-                upload_id, expected, total_bytes
-            )));
-        }
-
-        Ok(())
-    }
-
-    async fn finalize_upload(&self, upload: &Upload) -> Result<String> {
-        self.assemble_parts(
-            &upload.id,
-            &upload.filename,
-            upload.total_parts,
-            upload.target_path.as_deref(),
-        )
-        .await?;
-
-        Ok(build_response_path(
-            &upload.id,
-            &upload.filename,
-            upload.target_path.as_deref(),
-        ))
-    }
-
     async fn delete_parts(&self, upload_id: &str) -> Result<()> {
         let parts_dir = self.get_upload_parts_dir(upload_id);
 
@@ -285,6 +248,7 @@ impl StorageBackend for S3Storage {
     }
 
     async fn delete_file(&self, path: &str) -> Result<()> {
+        // Extract key from s3:// URL or use as-is
         let key = path
             .strip_prefix(&format!("s3://{}/", self.bucket))
             .unwrap_or(path);

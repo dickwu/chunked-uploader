@@ -9,7 +9,7 @@ use crate::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct InitUploadRequest {
-    pub filename: String,  // Can include path: "videos/2024/movie.mp4"
+    pub filename: String, // Can include path: "videos/2024/movie.mp4"
     pub total_size: i64,
     #[serde(default)]
     pub checksum_sha256: Option<String>,
@@ -63,13 +63,13 @@ pub async fn init_upload(
             .and_then(|n| n.to_str())
             .unwrap_or(&request.filename)
             .to_string();
-        
+
         let parent = path
             .parent()
             .and_then(|p| p.to_str())
             .filter(|p| !p.is_empty())
             .map(|p| p.to_string());
-        
+
         (parent, filename)
     };
 

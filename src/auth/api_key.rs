@@ -1,9 +1,4 @@
-use axum::{
-    extract::Request,
-    http::HeaderMap,
-    middleware::Next,
-    response::Response,
-};
+use axum::{extract::Request, http::HeaderMap, middleware::Next, response::Response};
 
 use crate::error::{AppError, Result};
 
@@ -39,4 +34,3 @@ pub async fn api_key_middleware(
     // to access AppState for the expected key
     Ok(next.run(request).await)
 }
-

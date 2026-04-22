@@ -63,7 +63,10 @@ pub async fn complete_upload(
     if upload.status == UploadStatus::Finalizing {
         // Re-trigger if finalization has been stale for >5 minutes (dead task from restart/crash)
         const STALE_THRESHOLD_SECS: i64 = 300;
-        if let Ok(true) = state.db.restart_stale_finalization(&upload_id, STALE_THRESHOLD_SECS) {
+        if let Ok(true) = state
+            .db
+            .restart_stale_finalization(&upload_id, STALE_THRESHOLD_SECS)
+        {
             tracing::warn!(
                 "Re-triggering stale finalization for upload {} (no progress for >{}s)",
                 upload_id,
@@ -161,7 +164,11 @@ pub async fn run_finalization_task(state: AppState, upload_id: String) {
     let _permit = match state.finalization_semaphore.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => {
-            tracing::error!("Failed to acquire finalization semaphore for {}: {}", upload_id, e);
+            tracing::error!(
+                "Failed to acquire finalization semaphore for {}: {}",
+                upload_id,
+                e
+            );
             return;
         }
     };
@@ -169,7 +176,11 @@ pub async fn run_finalization_task(state: AppState, upload_id: String) {
     let upload = match state.db.get_upload(&upload_id) {
         Ok(upload) => upload,
         Err(e) => {
-            tracing::error!("Failed to load upload {} for finalization: {}", upload_id, e);
+            tracing::error!(
+                "Failed to load upload {} for finalization: {}",
+                upload_id,
+                e
+            );
             return;
         }
     };
@@ -202,7 +213,11 @@ pub async fn run_finalization_task(state: AppState, upload_id: String) {
 
         let progress = 1 + (((index + 1) as i32 * 89) / (total as i32));
         if let Err(e) = state.db.update_finalizing_progress(&upload_id, progress) {
-            tracing::warn!("Failed to update finalizing progress for {}: {}", upload_id, e);
+            tracing::warn!(
+                "Failed to update finalizing progress for {}: {}",
+                upload_id,
+                e
+            );
         }
     }
 
@@ -216,7 +231,11 @@ pub async fn run_finalization_task(state: AppState, upload_id: String) {
     }
 
     if let Err(e) = state.db.update_finalizing_progress(&upload_id, 10) {
-        tracing::warn!("Failed to update finalizing progress for {}: {}", upload_id, e);
+        tracing::warn!(
+            "Failed to update finalizing progress for {}: {}",
+            upload_id,
+            e
+        );
     }
 
     // Heartbeat: increment progress every 5s while finalize_upload runs.
@@ -238,11 +257,7 @@ pub async fn run_finalization_task(state: AppState, upload_id: String) {
     let final_path = match finalize_result {
         Ok(path) => path,
         Err(e) => {
-            mark_finalization_failed(
-                &state,
-                &upload_id,
-                &format!("Finalization failed: {}", e),
-            );
+            mark_finalization_failed(&state, &upload_id, &format!("Finalization failed: {}", e));
             return;
         }
     };
@@ -256,7 +271,11 @@ pub async fn run_finalization_task(state: AppState, upload_id: String) {
         return;
     }
 
-    tracing::info!("Upload {} finalized successfully at {}", upload_id, final_path);
+    tracing::info!(
+        "Upload {} finalized successfully at {}",
+        upload_id,
+        final_path
+    );
 
     if let Some(webhook_url) = &upload.webhook_url {
         let payload = WebhookPayload {
@@ -312,11 +331,7 @@ async fn send_webhook(url: &str, payload: &WebhookPayload) {
     {
         Ok(response) => {
             if response.status().is_success() {
-                tracing::info!(
-                    "Webhook sent successfully: {} - {}",
-                    url,
-                    response.status()
-                );
+                tracing::info!("Webhook sent successfully: {} - {}", url, response.status());
             } else {
                 tracing::warn!(
                     "Webhook returned non-success status: {} - {}",

@@ -243,7 +243,7 @@ Completed status example:
   "upload_progress_percent": 100,
   "finalizing_progress_percent": 100,
   "finalization_error": null,
-  "final_path": "./uploads/files/550e8400..._large-video.mp4",
+  "final_path": "./uploads/550e8400..._large-video.mp4",
   "storage_backend": "local"
 }
 ```
@@ -661,7 +661,7 @@ When initializing an upload, you can provide a `webhook_url`. When the upload co
   "file_id": "550e8400-e29b-41d4-a716-446655440000",
   "filename": "large-video.mp4",
   "total_size": 10737418240,
-  "final_path": "./uploads/files/550e8400..._large-video.mp4",
+  "final_path": "./uploads/550e8400..._large-video.mp4",
   "storage_backend": "local",
   "completed_at": "2025-12-15T10:30:00Z"
 }

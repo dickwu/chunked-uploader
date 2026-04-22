@@ -68,20 +68,21 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "smb")]
         config::StorageBackendType::Smb => {
             tracing::info!("Temp storage: {}", config.temp_storage_path);
-            tracing::info!("SMB: smb://{}@{}:{}/{}", config.smb_user, config.smb_host, config.smb_port, config.smb_share);
-            Arc::new(storage::smb::SmbStorage::new(
-                &config,
-                &config.temp_storage_path,
-            ).await?)
+            tracing::info!(
+                "SMB: smb://{}@{}:{}/{}",
+                config.smb_user,
+                config.smb_host,
+                config.smb_port,
+                config.smb_share
+            );
+            Arc::new(storage::smb::SmbStorage::new(&config, &config.temp_storage_path).await?)
         }
         #[cfg(not(feature = "smb"))]
         config::StorageBackendType::Smb => {
             anyhow::bail!("SMB storage backend requires the 'smb' feature. Rebuild with: cargo build --features smb")
         }
         #[cfg(feature = "s3")]
-        config::StorageBackendType::S3 => {
-            Arc::new(storage::s3::S3Storage::new(&config).await?)
-        }
+        config::StorageBackendType::S3 => Arc::new(storage::s3::S3Storage::new(&config).await?),
         #[cfg(not(feature = "s3"))]
         config::StorageBackendType::S3 => {
             anyhow::bail!("S3 storage backend requires the 's3' feature. Rebuild with: cargo build --features s3")

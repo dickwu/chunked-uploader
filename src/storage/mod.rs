@@ -8,52 +8,14 @@ pub mod s3;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::path::Path;
 
 use crate::db::schema::Upload;
 use crate::error::Result;
 
-/// Sanitize a target path: strip leading/trailing slashes, allow only safe characters.
-/// Shared across all storage backends.
-pub fn sanitize_target_path(path: &str) -> String {
-    path.trim_matches('/')
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_')
-        .collect()
-}
-
-/// Build a clean, backend-agnostic response path for the client.
-/// Returns relative paths like `videos/2024/uuid_movie.mp4` or `files/uuid_movie.mp4`.
-pub fn build_response_path(upload_id: &str, filename: &str, target_path: Option<&str>) -> String {
-    let safe_filename = Path::new(filename)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unnamed");
-
-    let final_filename = format!("{}_{}", upload_id, safe_filename);
-
-    match target_path {
-        Some(path) => {
-            let clean_path = sanitize_target_path(path);
-            if clean_path.is_empty() {
-                final_filename
-            } else {
-                format!("{}/{}", clean_path, final_filename)
-            }
-        }
-        None => format!("files/{}", final_filename),
-    }
-}
-
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Store a chunk/part of an upload
-    async fn store_part(
-        &self,
-        upload: &Upload,
-        part_number: i32,
-        data: Bytes,
-    ) -> Result<String>;
+    async fn store_part(&self, upload: &Upload, part_number: i32, data: Bytes) -> Result<String>;
 
     /// Read a part back (for assembly or verification)
     async fn read_part(&self, upload_id: &str, part_number: i32) -> Result<Bytes>;
@@ -97,7 +59,7 @@ pub trait StorageBackend: Send + Sync {
 
     /// Get the backend type name
     fn backend_type(&self) -> &'static str;
-    
+
     /// Check if backend is healthy (connected and writable)
     /// Returns (is_healthy, optional_message)
     async fn health_check(&self) -> (bool, Option<String>) {

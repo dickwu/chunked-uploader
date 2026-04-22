@@ -6,12 +6,12 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use smb::binrw_util::prelude::SizedWideString;
 use smb::{
     Client, ClientConfig, CreateDisposition, CreateOptions, Dialect, FileAccessMask,
     FileAttributes, FileCreateArgs, FileDispositionInformation, FileRenameInformation,
     FileStandardInformation, Resource, UncPath, WriteAt,
 };
-use smb::binrw_util::prelude::SizedWideString;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
-use super::{build_response_path, sanitize_target_path, StorageBackend};
+use super::StorageBackend;
 use crate::config::Config;
 use crate::db::schema::Upload;
 use crate::error::{AppError, Result};
@@ -48,10 +48,10 @@ pub struct SmbStorage {
 
 #[derive(Clone)]
 struct SmbConfig {
-    unc_path: String,  // \\server\share format
-    host: String,      // SMB server hostname/IP
-    share: String,     // SMB share name
-    port: u16,         // SMB port
+    unc_path: String, // \\server\share format
+    host: String,     // SMB server hostname/IP
+    share: String,    // SMB share name
+    port: u16,        // SMB port
     username: String,
     password: String,
     base_path: String, // Path within share (e.g., "Sermons/files")
@@ -66,7 +66,10 @@ impl SmbStorage {
         let unc_path = if config.smb_port == 445 {
             format!(r"\\{}\{}", config.smb_host, config.smb_share)
         } else {
-            format!(r"\\{}:{}\{}", config.smb_host, config.smb_port, config.smb_share)
+            format!(
+                r"\\{}:{}\{}",
+                config.smb_host, config.smb_port, config.smb_share
+            )
         };
 
         let base_path = config.smb_path.trim_matches('/').to_string();
@@ -149,8 +152,9 @@ impl SmbStorage {
 
         tracing::info!("SMB client configured for SMB 3.0+ (min: SMB 3.0, max: SMB 3.1.1)");
 
-        let unc_path = UncPath::from_str(&config.unc_path)
-            .map_err(|e| AppError::Storage(format!("Invalid UNC path {}: {}", config.unc_path, e)))?;
+        let unc_path = UncPath::from_str(&config.unc_path).map_err(|e| {
+            AppError::Storage(format!("Invalid UNC path {}: {}", config.unc_path, e))
+        })?;
 
         tracing::info!("Attempting SMB connection to: {}", config.unc_path);
         tracing::debug!("  Host: {}:{}", config.host, config.port);
@@ -176,24 +180,36 @@ impl SmbStorage {
         let err_str = err.to_string().to_lowercase();
 
         if err_str.contains("no route to host") || err_str.contains("connection refused") {
-            format!("Network connectivity issue. Cannot reach SMB server at {}", config.unc_path)
+            format!(
+                "Network connectivity issue. Cannot reach SMB server at {}",
+                config.unc_path
+            )
         } else if err_str.contains("timeout") || err_str.contains("timed out") {
             "Connection timeout. Server may be unreachable or firewall blocking port".to_string()
         } else if err_str.contains("access denied")
             || err_str.contains("authentication")
             || err_str.contains("login")
         {
-            format!("Authentication failed. Check username '{}' and password", config.username)
+            format!(
+                "Authentication failed. Check username '{}' and password",
+                config.username
+            )
         } else if err_str.contains("not found") || err_str.contains("does not exist") {
-            format!("SMB share '{}' not found on server {}", config.share, config.host)
+            format!(
+                "SMB share '{}' not found on server {}",
+                config.share, config.host
+            )
         } else if err_str.contains("permission") {
-            format!("Permission denied. User '{}' may not have access to this share", config.username)
+            format!(
+                "Permission denied. User '{}' may not have access to this share",
+                config.username
+            )
         } else {
             format!("Connection error: {}", err)
         }
     }
 
-    fn verify_local_write(path: &Path) -> Result<()> {
+    fn verify_local_write(path: &PathBuf) -> Result<()> {
         let test_file = path.join(".write_test");
         let mut file = std::fs::File::create(&test_file).map_err(|e| {
             AppError::Storage(format!("No write permission for parts directory: {}", e))
@@ -235,9 +251,8 @@ impl SmbStorage {
 
             let current_path = unc_path.clone().with_path(&cumulative_path);
 
-            let open_args = FileCreateArgs::make_open_existing(
-                FileAccessMask::new().with_generic_read(true),
-            );
+            let open_args =
+                FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
 
             match client.create_file(&current_path, &open_args).await {
                 Ok(Resource::Directory(dir)) => {
@@ -255,6 +270,7 @@ impl SmbStorage {
                         attributes: FileAttributes::new().with_directory(true),
                         disposition: CreateDisposition::Create,
                         options: CreateOptions::new().with_directory_file(true),
+                        ..Default::default()
                     };
 
                     match client.create_file(&current_path, &create_args).await {
@@ -269,7 +285,9 @@ impl SmbStorage {
                         }
                         Err(e) => {
                             let err_str = e.to_string().to_lowercase();
-                            if !(err_str.contains("exists") || err_str.contains("object name collision")) {
+                            if !(err_str.contains("exists")
+                                || err_str.contains("object name collision"))
+                            {
                                 return Err(AppError::Storage(format!(
                                     "Failed to create SMB directory {}: {}",
                                     cumulative_path, e
@@ -283,6 +301,13 @@ impl SmbStorage {
         }
 
         Ok(())
+    }
+
+    fn sanitize_target_path(path: &str) -> String {
+        path.trim_matches('/')
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '/' || *c == '.' || *c == '-' || *c == '_')
+            .collect()
     }
 
     fn get_smb_file_path(
@@ -301,7 +326,7 @@ impl SmbStorage {
 
         match target_path {
             Some(path) => {
-                let clean_path = sanitize_target_path(path);
+                let clean_path = Self::sanitize_target_path(path);
                 if clean_path.is_empty() {
                     if base_path.is_empty() {
                         final_filename
@@ -334,6 +359,27 @@ impl SmbStorage {
             "{}.partial",
             self.get_smb_file_path(upload_id, filename, target_path)
         )
+    }
+
+    fn get_smb_response_path(upload_id: &str, filename: &str, target_path: Option<&str>) -> String {
+        let safe_filename = Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unnamed");
+
+        let final_filename = format!("{}_{}", upload_id, safe_filename);
+
+        match target_path {
+            Some(path) => {
+                let clean_path = Self::sanitize_target_path(path);
+                if clean_path.is_empty() {
+                    final_filename
+                } else {
+                    format!("{}/{}", clean_path, final_filename)
+                }
+            }
+            None => format!("files/{}", final_filename),
+        }
     }
 
     fn normalize_relative_path(config: &SmbConfig, path: &str) -> String {
@@ -369,8 +415,9 @@ impl SmbStorage {
     }
 
     fn build_unc_path_from_relative(config: &SmbConfig, path: &str) -> Result<UncPath> {
-        let base_unc = UncPath::from_str(&config.unc_path)
-            .map_err(|e| AppError::Storage(format!("Invalid UNC path {}: {}", config.unc_path, e)))?;
+        let base_unc = UncPath::from_str(&config.unc_path).map_err(|e| {
+            AppError::Storage(format!("Invalid UNC path {}: {}", config.unc_path, e))
+        })?;
         let normalized = Self::normalize_relative_path(config, path);
         Ok(base_unc.with_path(&normalized))
     }
@@ -485,16 +532,14 @@ impl SmbStorage {
     /// Get the size of an SMB file. Returns 0 if file doesn't exist.
     async fn get_smb_file_size(&self, client: &Client, smb_path_str: &str) -> Result<u64> {
         let unc_path = Self::build_unc_path_from_relative(&self.smb_config, smb_path_str)?;
-        let open_args = FileCreateArgs::make_open_existing(
-            FileAccessMask::new().with_generic_read(true),
-        );
+        let open_args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
 
         match client.create_file(&unc_path, &open_args).await {
             Ok(Resource::File(file)) => {
-                let info: FileStandardInformation = file
-                    .query_info()
-                    .await
-                    .map_err(|e| AppError::Storage(format!("Failed to query SMB file info: {}", e)))?;
+                let info: FileStandardInformation = file.query_info().await.map_err(|e| {
+                    AppError::Storage(format!("Failed to query SMB file info: {}", e))
+                })?;
                 let size = info.end_of_file;
                 file.close().await.ok();
                 Ok(size)
@@ -517,20 +562,20 @@ async fn background_sync_part(
 ) -> std::result::Result<(), String> {
     const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
-    match timeout(SYNC_TIMEOUT, background_sync_part_inner(
-        sync_client.clone(),
-        smb_config,
-        partial_path,
-        offset,
-        data,
-    ))
+    match timeout(
+        SYNC_TIMEOUT,
+        background_sync_part_inner(sync_client.clone(), smb_config, partial_path, offset, data),
+    )
     .await
     {
         Ok(result) => result,
         Err(_) => {
             // Timeout — drop the client (likely dead connection)
             sync_client.lock().await.take();
-            Err(format!("Background sync timed out after {}s", SYNC_TIMEOUT.as_secs()))
+            Err(format!(
+                "Background sync timed out after {}s",
+                SYNC_TIMEOUT.as_secs()
+            ))
         }
     }
 }
@@ -613,12 +658,7 @@ async fn background_sync_part_inner(
 #[async_trait]
 impl StorageBackend for SmbStorage {
     /// Store part to local disk (fast), then fire-and-forget background sync to SMB.
-    async fn store_part(
-        &self,
-        upload: &Upload,
-        part_number: i32,
-        data: Bytes,
-    ) -> Result<String> {
+    async fn store_part(&self, upload: &Upload, part_number: i32, data: Bytes) -> Result<String> {
         let upload_id = &upload.id;
         let part_path = self.get_local_part_path(upload_id, part_number);
         let data_len = data.len();
@@ -630,29 +670,28 @@ impl StorageBackend for SmbStorage {
             })?;
         }
 
-        let mut file = fs::File::create(&part_path).await.map_err(|e| {
-            AppError::Storage(format!("Failed to create part file: {}", e))
-        })?;
+        let mut file = fs::File::create(&part_path)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to create part file: {}", e)))?;
 
-        file.write_all(&data).await.map_err(|e| {
-            AppError::Storage(format!("Failed to write part data: {}", e))
-        })?;
+        file.write_all(&data)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to write part data: {}", e)))?;
 
-        file.flush().await.map_err(|e| {
-            AppError::Storage(format!("Failed to flush part data: {}", e))
-        })?;
+        file.flush()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to flush part data: {}", e)))?;
 
         tracing::debug!(
             "Stored part {} for upload {} locally ({} bytes)",
-            part_number, upload_id, data_len
+            part_number,
+            upload_id,
+            data_len
         );
 
         // Phase 2: Fire-and-forget background sync to SMB
-        let partial_path = self.get_smb_partial_path(
-            upload_id,
-            &upload.filename,
-            upload.target_path.as_deref(),
-        );
+        let partial_path =
+            self.get_smb_partial_path(upload_id, &upload.filename, upload.target_path.as_deref());
         let offset = (part_number as u64)
             .checked_mul(upload.chunk_size as u64)
             .unwrap_or(0);
@@ -661,14 +700,8 @@ impl StorageBackend for SmbStorage {
         let upload_id_owned = upload_id.to_string();
 
         tokio::spawn(async move {
-            if let Err(e) = background_sync_part(
-                sync_client,
-                &smb_config,
-                &partial_path,
-                offset,
-                data,
-            )
-            .await
+            if let Err(e) =
+                background_sync_part(sync_client, &smb_config, &partial_path, offset, data).await
             {
                 tracing::warn!(
                     "Background SMB sync failed for upload {} part {} (will retry during finalization): {}",
@@ -677,7 +710,9 @@ impl StorageBackend for SmbStorage {
             } else {
                 tracing::debug!(
                     "Background SMB sync complete for upload {} part {} ({} bytes)",
-                    upload_id_owned, part_number, data_len
+                    upload_id_owned,
+                    part_number,
+                    data_len
                 );
             }
         });
@@ -915,8 +950,9 @@ impl StorageBackend for SmbStorage {
                         Self::ensure_smb_dirs_for_path(&client, &self.smb_config, &final_path)
                             .await?;
 
-                        let file =
-                            self.open_existing_file(&client, &partial_path, true).await?;
+                        let file = self
+                            .open_existing_file(&client, &partial_path, true)
+                            .await?;
                         file.set_info(FileRenameInformation {
                             replace_if_exists: true.into(),
                             root_directory: 0,
@@ -924,10 +960,7 @@ impl StorageBackend for SmbStorage {
                         })
                         .await
                         .map_err(|e| {
-                            AppError::Storage(format!(
-                                "Failed to rename SMB partial file: {}",
-                                e
-                            ))
+                            AppError::Storage(format!("Failed to rename SMB partial file: {}", e))
                         })?;
 
                         if let Err(e) = file.close().await {
@@ -964,16 +997,12 @@ impl StorageBackend for SmbStorage {
 
                     self.remove_upload_lock(upload_id).await;
 
-                    let response_path = build_response_path(
+                    let response_path = Self::get_smb_response_path(
                         upload_id,
                         &upload.filename,
                         upload.target_path.as_deref(),
                     );
-                    tracing::info!(
-                        "Finalized upload {} to SMB path {}",
-                        upload_id,
-                        final_path
-                    );
+                    tracing::info!("Finalized upload {} to SMB path {}", upload_id, final_path);
                     return Ok(response_path);
                 }
                 Err(e) => {

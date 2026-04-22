@@ -9,7 +9,7 @@ pub struct Upload {
     pub total_parts: i32,
     pub status: UploadStatus,
     pub storage_backend: String,
-    pub target_path: Option<String>,  // Custom path for the file (e.g., "videos/2024/")
+    pub target_path: Option<String>, // Custom path for the file (e.g., "videos/2024/")
     pub final_path: Option<String>,
     pub checksum_sha256: Option<String>,
     pub webhook_url: Option<String>,

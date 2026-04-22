@@ -18,20 +18,27 @@ pub struct StorageInfo {
 
 pub async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
     let backend_type = state.storage.backend_type().to_string();
-    
+
     // Use the backend's health_check method
     let (is_healthy, message) = state.storage.health_check().await;
-    
+
     let storage_status = if is_healthy { "healthy" } else { "unavailable" };
     let overall_status = if is_healthy { "OK" } else { "DEGRADED" };
-    let http_status = if is_healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let http_status = if is_healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
 
-    (http_status, Json(HealthResponse {
-        status: overall_status.to_string(),
-        storage: StorageInfo {
-            backend_type,
-            status: storage_status.to_string(),
-            message,
-        },
-    }))
+    (
+        http_status,
+        Json(HealthResponse {
+            status: overall_status.to_string(),
+            storage: StorageInfo {
+                backend_type,
+                status: storage_status.to_string(),
+                message,
+            },
+        }),
+    )
 }

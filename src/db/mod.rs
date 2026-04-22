@@ -27,9 +27,10 @@ impl Database {
     }
 
     pub fn run_migrations(&self) -> Result<()> {
-        let conn = self.pool.get().map_err(|e| {
-            AppError::Internal(format!("Failed to get database connection: {}", e))
-        })?;
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| AppError::Internal(format!("Failed to get database connection: {}", e)))?;
 
         // Create uploads table
         conn.execute(
@@ -61,8 +62,14 @@ impl Database {
         // Add columns if they don't exist (migrations for existing DBs)
         let _ = conn.execute("ALTER TABLE uploads ADD COLUMN webhook_url TEXT", []);
         let _ = conn.execute("ALTER TABLE uploads ADD COLUMN target_path TEXT", []);
-        let _ = conn.execute("ALTER TABLE uploads ADD COLUMN finalization_started_at INTEGER", []);
-        let _ = conn.execute("ALTER TABLE uploads ADD COLUMN finalization_updated_at INTEGER", []);
+        let _ = conn.execute(
+            "ALTER TABLE uploads ADD COLUMN finalization_started_at INTEGER",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE uploads ADD COLUMN finalization_updated_at INTEGER",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE uploads ADD COLUMN finalization_error TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE uploads ADD COLUMN finalizing_progress_percent INTEGER NOT NULL DEFAULT 0",
@@ -105,9 +112,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_conn(
-        &self,
-    ) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+    pub fn get_conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         self.pool
             .get()
             .map_err(|e| AppError::Internal(format!("Failed to get database connection: {}", e)))

@@ -35,7 +35,9 @@ pub async fn upload_part(
         .get(AUTHORIZATION_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| AppError::Unauthorized("Missing or invalid Authorization header".to_string()))?;
+        .ok_or_else(|| {
+            AppError::Unauthorized("Missing or invalid Authorization header".to_string())
+        })?;
 
     // Validate JWT token
     let token_generator = PartTokenGenerator::new(&state.config.jwt_secret);
@@ -70,7 +72,9 @@ pub async fn upload_part(
     // Validate token hash
     let token_hash = PartTokenGenerator::hash_token(token);
     if token_hash != part.token_hash {
-        return Err(AppError::Unauthorized("Invalid token for this part".to_string()));
+        return Err(AppError::Unauthorized(
+            "Invalid token for this part".to_string(),
+        ));
     }
 
     // Validate size
