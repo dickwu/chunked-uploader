@@ -26,6 +26,9 @@ pub enum AppError {
     #[error("Storage error: {0}")]
     Storage(String),
 
+    #[error("Insufficient storage: {0}")]
+    InsufficientStorage(String),
+
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
 
@@ -45,6 +48,7 @@ impl IntoResponse for AppError {
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             AppError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+            AppError::InsufficientStorage(msg) => (StatusCode::INSUFFICIENT_STORAGE, msg.clone()),
             AppError::Database(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             AppError::Jwt(e) => (StatusCode::UNAUTHORIZED, e.to_string()),
             AppError::Io(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),

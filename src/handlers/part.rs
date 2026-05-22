@@ -86,6 +86,34 @@ pub async fn upload_part(
         )));
     }
 
+    // Pre-flight: ensure the temp filesystem has room for this part plus a small headroom.
+    // Returns 507 Insufficient Storage so the SDK can distinguish "we're full" from a
+    // generic 500. Prevents the misleading "stuck at last 1%" symptom that happens when
+    // EDQUOT/ENOSPC repeatedly fails the same chunk during the SDK's bounded retries.
+    {
+        use fs2::available_space;
+        const HEADROOM_BYTES: u64 = 16 * 1024 * 1024; // 16 MB
+        let temp_path = std::path::Path::new(&state.config.temp_storage_path);
+        match available_space(temp_path) {
+            Ok(free) => {
+                let needed = body_len as u64 + HEADROOM_BYTES;
+                if free < needed {
+                    return Err(AppError::InsufficientStorage(format!(
+                        "Temp storage low: {} bytes free at {}, need {} (part {} of upload {})",
+                        free, state.config.temp_storage_path, needed, part_num, upload_id
+                    )));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Free-space check failed for {}: {} (proceeding without pre-flight)",
+                    state.config.temp_storage_path,
+                    e
+                );
+            }
+        }
+    }
+
     // Calculate checksum
     let mut hasher = Sha256::new();
     hasher.update(&body);

@@ -63,6 +63,9 @@ bytes = "1"
 # HTTP client for webhooks
 reqwest = { version = "0.13", features = ["json"] }
 
+# Filesystem free-space query (statvfs wrapper) — used for 507 pre-flight
+fs2 = "0.4"
+
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["json"] }
 hex = "0.4"
